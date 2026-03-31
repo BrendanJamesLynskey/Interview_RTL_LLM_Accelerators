@@ -1,0 +1,85 @@
+# Compiled files
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Simulation and synthesis artifacts
+/work/
+/sim/
+/synth/
+/build/
+*.vcd
+*.vpd
+*.wdb
+*.fsdb
+*.shm
+*.log
+*.history
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Vivado and Quartus
+.Xil/
+*.jou
+*.pb
+*.xpr
+*.xsim/
+db/
+incremental_db/
+output_files/
+simulation/
+*.rpt
+*.txt
+
+# Modelsim and other simulators
+transcript
+vsim.wdb
+*.asdb
+*.asdbg
+
+# Tool-generated
+.cache/
+.project
+.pydevproject
+.settings/
+*.ott
+
+# Documentation
+site/
+docs/_build/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS-specific
+Thumbs.db
+.DS_Store
