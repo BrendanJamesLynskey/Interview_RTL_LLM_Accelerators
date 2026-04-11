@@ -143,7 +143,7 @@ $$B_{\max}(S) = \left\lfloor \frac{22.4 \times 10^9}{S \times 327,680} \right\rf
 decreases proportionally ($133 \to 33 \approx 133/4$). The KV cache memory scales as
 $B \times S$, so longer sequences directly reduce the viable batch size.
 
-**Practical headroom**: In practice, reserve $5$–$10\%$ of HBM for:
+**Practical headroom**: In practice, reserve $5\text{–}10\%$ of HBM for:
 - Activation tensors during forward pass
 - CUDA/driver overhead
 - PagedAttention block table metadata

@@ -44,7 +44,7 @@ matrix-vector products. The arithmetic intensity of a GEMV is:
 
 $$I_{\text{GEMV}} = \frac{2 \cdot m \cdot n}{2 \cdot m \cdot n \cdot \text{bpe}} = \frac{1}{\text{bpe}} \approx \begin{cases} 0.5 & \text{INT8} \\ 1 & \text{FP16} \end{cases}$$
 
-Modern accelerators have ridge points of $I^* \approx 50$–$200$ FLOP/Byte. A GEMV has
+Modern accelerators have ridge points of $I^* \approx 50\text{–}200$ FLOP/Byte. A GEMV has
 intensity of order 1. The decode step therefore wastes $\sim 99\%$ of the compute budget
 waiting for memory.
 
@@ -447,7 +447,7 @@ sustained bandwidth utilisation.
 | INT4 quantisation | $4\times$ | High | Medium | Throughput-critical |
 | FP8 KV cache | $2\times$ KV | Low | Low | Long-context |
 | Weight SRAM residency | Up to $R\times$ | High | None | Low-latency single-user |
-| HBM scheduling | $1.1$–$1.3\times$ | Medium | None | All workloads |
+| HBM scheduling | $1.1\text{–}1.3\times$ | Medium | None | All workloads |
 
 In practice, production chips combine all three: quantised weights reduce bytes moved, SRAM
 holds hot activations, and the memory controller is optimised for sequential streaming access.

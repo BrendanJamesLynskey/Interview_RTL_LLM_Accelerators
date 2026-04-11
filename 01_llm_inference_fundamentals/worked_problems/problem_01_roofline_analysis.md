@@ -316,7 +316,7 @@ ratio. It does not help compute-bound prefill at all.
 
 4. **Assuming peak bandwidth is achievable**: The $\beta = 5\ \text{TB/s}$ is theoretical
    peak. Practical efficiency (accounting for HBM scheduling overhead, row activation
-   latency, and controller efficiency) is typically $85$–$95\%$ of peak for well-optimised
+   latency, and controller efficiency) is typically $85\text{–}95\%$ of peak for well-optimised
    sequential streaming. Plot the roofline using peak bandwidth, but note real performance
    will be slightly below.
 

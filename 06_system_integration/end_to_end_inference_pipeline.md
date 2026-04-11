@@ -279,7 +279,7 @@ For $B_{decode} = 16$ and $C = 128$: $B_{eff} = 144$ tokens, well within typical
 Larger $C$ → fewer total prefill steps → lower time to serve the new request.
 Smaller $C$ → less latency impact on existing decode requests per step.
 
-Typical production values: $C = 64$–$512$ with $C$ chosen dynamically based on decode queue depth.
+Typical production values: $C = 64\text{–}512$ with $C$ chosen dynamically based on decode queue depth.
 
 ---
 

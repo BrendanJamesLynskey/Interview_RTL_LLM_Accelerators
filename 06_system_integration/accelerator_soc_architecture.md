@@ -495,7 +495,7 @@ modest. But for batch size 64 and continuous batching, the figure scales to ~32 
 requires NVLink/UCIe class links.
 
 **Pipeline parallelism (PP):**
-- Layer 0–$k$ run on chip 0, layers $k+1$–$2k$ run on chip 1, etc.
+- Layer 0–$k$ run on chip 0, layers $k+1\text{–}2k$ run on chip 1, etc.
 - Each chip processes a **different micro-batch** in a pipeline fashion.
 - Requires point-to-point **activation transfer** between adjacent chips at each pipeline boundary.
 - Bandwidth requirement is per-boundary: one activation tensor of size $[B, d] \times 2$ B per

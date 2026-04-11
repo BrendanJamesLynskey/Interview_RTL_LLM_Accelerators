@@ -368,9 +368,9 @@ The critical path runs through:
 3. **INT8 to FP16 conversion**: INT8 has implicit exponent; conversion requires
    a leading-zero detector (priority encoder, $\sim 4$ gate levels) + normalisation shift.
 4. **FP16 multiply** (scale application): FP16 multiplier critical path is typically
-   $\sim 8$–$12$ FO4 delays in 7nm.
+   $\sim 8\text{–}12$ FO4 delays in 7nm.
 
-Total critical path for dequantisation: dominated by FP16 multiply, $\approx 8$–$12$ FO4.
+Total critical path for dequantisation: dominated by FP16 multiply, $\approx 8\text{–}12$ FO4.
 
 **Area considerations**:
 
@@ -396,7 +396,7 @@ directly at lower cost.
 **The outlier problem**:
 
 In LLM activations, a small number of channels (often $< 1\%$) can have magnitudes
-$100$–$1000\times$ larger than the typical channel. A per-tensor INT8 scale chosen to
+$100\text{–}1000\times$ larger than the typical channel. A per-tensor INT8 scale chosen to
 accommodate these outliers assigns most of the quantisation range to values near zero,
 giving those channels effectively only 1–2 bits of precision. This causes large quantisation
 error and accuracy degradation.
