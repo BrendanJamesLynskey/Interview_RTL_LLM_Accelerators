@@ -101,6 +101,7 @@ Methodology for validating accelerator correctness and performance.
 - `constrained_random_for_accelerators.md` — Constrained-random testing for compute-heavy designs
 - `coverage_strategy.md` — Coverage metrics for accelerator verification
 - `coding_challenges/` — Build matmul golden models, softmax testbenches, and coverage plans
+  - [`softmax_golden.c`](07_verification/coding_challenges/softmax_golden.c) — DPI-C golden model linked with the softmax testbench
 
 ## 08 - Quizzes
 

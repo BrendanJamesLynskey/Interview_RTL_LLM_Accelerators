@@ -270,13 +270,15 @@ module llm_core_coverage (
             illegal_bins idle_to_flush = (PIPE_IDLE => PIPE_FLUSHING);
         }
 
-        // Sustained stall depth: observe 1, 2, 4, 8+ consecutive stall cycles.
-        // Implemented via a sequence of transitions.
+        // Sustained stall depth: observe 1, 2, 4, 8-16 consecutive stall cycles.
+        // Implemented via a sequence of transitions. Transition repeat ranges
+        // must be bounded ([*8:$] is not legal in a bin), so the deepest bin
+        // uses an explicit upper limit.
         cp_stall_depth: coverpoint cif.pipe_state {
             bins stall_1_cycle  = (PIPE_COMPUTING => PIPE_STALLED => PIPE_COMPUTING);
             bins stall_2_cycles = (PIPE_COMPUTING => PIPE_STALLED[*2] => PIPE_COMPUTING);
             bins stall_4_cycles = (PIPE_COMPUTING => PIPE_STALLED[*4] => PIPE_COMPUTING);
-            bins stall_8_cycles = (PIPE_COMPUTING => PIPE_STALLED[*8:$] => PIPE_COMPUTING);
+            bins stall_8_cycles = (PIPE_COMPUTING => PIPE_STALLED[*8:16] => PIPE_COMPUTING);
         }
 
     endgroup : cg_pipeline_states
@@ -306,12 +308,12 @@ module llm_core_coverage (
             bins all_max    = {PAT_ALL_MAX};
             bins all_min    = {PAT_ALL_MIN};
             bins random     = {PAT_RANDOM};
-            bins denormal   = {PAT_DENORMAL};
-            // Denormal is meaningless for integer modes — ignore rather than
-            // mark illegal so the planner doesn't force impossible stimuli.
-            ignore_bins int_denormal =
-                binsof(cp_input_a_pattern.denormal) &&
-                (cif.precision inside {PREC_INT8, PREC_INT4});
+            // Denormal is meaningless for integer modes, so only count it in
+            // FP modes (rather than marking it illegal, which would flag
+            // harmless stimuli). binsof() is only legal in cross bins, so the
+            // condition goes in an iff guard on the bin itself.
+            bins denormal   = {PAT_DENORMAL}
+                              iff (!(cif.precision inside {PREC_INT8, PREC_INT4}));
         }
 
         cp_input_b_pattern: coverpoint cif.input_b_pattern {
@@ -319,10 +321,8 @@ module llm_core_coverage (
             bins all_max    = {PAT_ALL_MAX};
             bins all_min    = {PAT_ALL_MIN};
             bins random     = {PAT_RANDOM};
-            bins denormal   = {PAT_DENORMAL};
-            ignore_bins int_denormal =
-                binsof(cp_input_b_pattern.denormal) &&
-                (cif.precision inside {PREC_INT8, PREC_INT4});
+            bins denormal   = {PAT_DENORMAL}
+                              iff (!(cif.precision inside {PREC_INT8, PREC_INT4}));
         }
 
         // Cross A x B patterns: corner combinations are the most interesting.
@@ -352,9 +352,8 @@ module llm_core_coverage (
         cp_nan:       coverpoint cif.nan_flag {
             bins seen = {1'b1};
             // NaN is illegal in integer modes — flag its assertion as an error.
-            illegal_bins int_nan =
-                binsof(cp_nan.seen) &&
-                (cif.precision inside {PREC_INT8, PREC_INT4});
+            illegal_bins int_nan = {1'b1}
+                                   iff (cif.precision inside {PREC_INT8, PREC_INT4});
         }
 
     endgroup : cg_data_patterns

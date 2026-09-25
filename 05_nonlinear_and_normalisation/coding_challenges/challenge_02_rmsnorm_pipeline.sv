@@ -35,8 +35,10 @@
 //   Stage 2 (S2):  Compute mean by right-shifting the sum by log2(DIM).
 //                  (Requires DIM to be a power of two for a simple shift.)
 //   Stage 3 (S3):  Approximate 1/sqrt(mean) via Newton-Raphson iteration.
-//                  Uses the fast initial estimate:  y0 = magic_const >> (msb/2)
-//                  Then refines: y_{n+1} = y_n * (1.5 - 0.5 * mean * y_n^2)
+//                  Range reduction: write mean = m * 4^k with m in [1, 4),
+//                  seed y0 ~ 1/sqrt(m) from a 4-entry table (< 11% error),
+//                  refine y_{n+1} = y_n * (1.5 - 0.5 * m * y_n^2), then
+//                  scale the result by 2^-k.
 //   Stage 4 (S4):  Multiply each original input element by inv_rms and gamma.
 //                  Runs over DIM clock cycles to emit the output vector.
 //
@@ -61,7 +63,8 @@
 //   DATA_W    : total width of a Q8.16 sample (should be 25)
 //   Q_FRAC    : fractional bits (16 for Q8.16)
 //   ACC_W     : accumulator width for sum-of-squares (must hold DIM * max_sq)
-//   NR_ITERS  : Newton-Raphson iterations (2 gives ~24-bit accuracy)
+//   NR_ITERS  : Newton-Raphson iterations (seed error < 11%; 2 iterations
+//               give ~3e-4 relative error, 3 give ~1e-7)
 // ---------------------------------------------------------------------------
 module rmsnorm_pipeline #(
     parameter int unsigned DIM     = 8,    // vector dimension (power-of-2)
@@ -132,16 +135,21 @@ module rmsnorm_pipeline #(
     localparam int unsigned NR_W = 34;          // Q2.30 +  guard bit
     localparam int unsigned NR_FRAC = 30;       // fractional bits in NR domain
 
-    logic [NR_W-1:0]   s3_y;                    // current NR estimate
-    logic [NR_W-1:0]   s3_half_mean;            // 0.5 * mean_sq in NR domain
+    // 1/RMS itself needs more integer bits than the NR domain: the smallest
+    // non-zero mean (2^-16) gives 1/RMS = 2^8. INV_W holds Q9.30 unsigned.
+    localparam int unsigned INV_W = NR_FRAC + 10;
+
+    logic [NR_W-1:0]   s3_y;                    // current NR estimate of 1/sqrt(m)
+    logic [NR_W-1:0]   s3_half_mean;            // 0.5 * m in NR domain, m in [1, 4)
+    logic signed [6:0] s3_k;                    // range-reduction exponent: mean = m * 4^k
     logic [NR_ITERS:0] s3_iter;                 // one-hot iteration counter
-    logic [NR_W-1:0]   s3_inv_rms;              // final 1/RMS result
+    logic [INV_W-1:0]  s3_inv_rms;              // final 1/RMS result (Q9.30)
 
     // -----------------------------------------------------------------------
     // Stage 4 signals — output multiply
     // -----------------------------------------------------------------------
     logic [$clog2(DIM)-1:0]    s4_ptr;          // output element index
-    logic signed [2*NR_W-1:0]  s4_prod_tmp;    // x_i * inv_rms (before truncation)
+    logic signed [INV_W+DATA_W:0] s4_prod_tmp; // x_i * inv_rms (before truncation)
     logic signed [2*DATA_W-1:0] s4_out_tmp;    // * gamma_i (before truncation)
 
     // -----------------------------------------------------------------------
@@ -235,102 +243,109 @@ module rmsnorm_pipeline #(
     // Stage 2 — divide sum by DIM (power-of-2 right shift)
     //
     // s1_acc_latch holds  sum( x_i^2 )  in Q(8+DIM_LOG2).16 format.
-    // Shifting right by DIM_LOG2 gives the mean in Q8.16.
+    // Shifting right by DIM_LOG2 gives the mean in Q8.16. This is a pure
+    // shift, so it is combinational: Stage 3 consumes it in ST_MEAN, the cycle
+    // after s1_acc_latch is written.
     // -----------------------------------------------------------------------
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) s2_mean_sq <= '0;
-        else if (state == ST_MEAN)
-            s2_mean_sq <= s1_acc_latch >> DIM_LOG2;
-    end
+    assign s2_mean_sq = s1_acc_latch >> DIM_LOG2;
 
     // -----------------------------------------------------------------------
     // Stage 3 — 1/sqrt(mean_sq) via Newton-Raphson
     //
-    // The fast inverse-square-root iteration (Quake-style) converges as:
-    //   y_{n+1} = y_n * (3/2 - x/2 * y_n^2)
+    // The inverse-square-root iteration converges as:
+    //   y_{n+1} = y_n * (3/2 - m/2 * y_n^2)
+    // but only for 0 < y_0 < sqrt(3/m), and quadratically only once y_0 is
+    // close. So we range-reduce first:
     //
-    // where x = mean_sq.  We represent everything in Q2.30 (NR_W bits) to
-    // retain enough precision through several iterations.
+    //   p    = position of the leading 1 in mean_sq (Q8.16)
+    //   e    = p - Q_FRAC                  so mean_sq in [2^e, 2^(e+1))
+    //   k    = floor(e / 2)                so m = mean_sq * 4^-k is in [1, 4)
+    //   1/sqrt(mean_sq) = 1/sqrt(m) * 2^-k
     //
-    // Initial estimate strategy:
-    //   Find the position of the leading '1' bit in mean_sq (call it 'msb').
-    //   Then  1/sqrt(mean_sq) ≈ 2^( -(msb-NR_FRAC)/2 )  as a starting point.
-    //   This gives a relative error < 50% which NR iterations rapidly reduce.
-    //
-    // INTERVIEW NOTE: A production design would use a small seed LUT (e.g.,
-    // index the top 6 bits of the mantissa) to get a much tighter initial
-    // estimate and require only one NR iteration for sufficient accuracy.
+    // m is represented in Q2.30 (NR_W bits), where it always fits. The seed
+    // comes from a 4-entry table indexed by the parity of e (m in [1,2) or
+    // [2,4)) and the bit just below the leading 1 (lower/upper half of that
+    // interval). Its worst-case relative error is under 11%, so two NR
+    // iterations reach ~3e-4 and three reach ~1e-7.
     // -----------------------------------------------------------------------
     logic [5:0] s3_msb_pos; // position of leading 1 in mean_sq
 
     // Leading-one detector (combinational)
     always_comb begin
         s3_msb_pos = '0;
-        for (int i = ACC_W-1; i >= 0; i--) begin
-            if (s2_mean_sq[i] && (s3_msb_pos == 0))
+        for (int i = 0; i < ACC_W; i++) begin
+            if (s2_mean_sq[i])
                 s3_msb_pos = 6'(i);
         end
     end
+
+    // Seed table: approx 1/sqrt(m) over each quarter-octave, in Q2.30
+    function automatic logic [NR_W-1:0] nr_seed(input logic odd_e, input logic next_bit);
+        unique case ({odd_e, next_bit})
+            2'b00: return NR_W'(64'd966367642);   // 0.90  for m in [1.0, 1.5)
+            2'b01: return NR_W'(64'd816043786);   // 0.76  for m in [1.5, 2.0)
+            2'b10: return NR_W'(64'd687194767);   // 0.64  for m in [2.0, 3.0)
+            default: return NR_W'(64'd579820584); // 0.54  for m in [3.0, 4.0)
+        endcase
+    endfunction
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             s3_y         <= '0;
             s3_half_mean <= '0;
+            s3_k         <= '0;
             s3_iter      <= 1; // start at bit 0 (iteration 0 = init)
             s3_inv_rms   <= '0;
         end else begin
             if (state == ST_MEAN) begin
-                // On the cycle we compute mean_sq, also set up the NR seed.
-                // mean_sq is in Q(8+DIM_LOG2-DIM_LOG2).16 = Q8.16.
-                // Convert to NR_FRAC domain: scale by 2^(NR_FRAC - Q_FRAC).
-                //
-                // Initial estimate: y0 = 2^( floor((NR_FRAC - msb_of_mean)/2) )
-                // msb_of_mean is in terms of the Q8.16 representation.
-                // After the >> DIM_LOG2 shift the mean is still Q8.16 aligned
-                // inside s2_mean_sq; effective bit position = s3_msb_pos.
-                logic [NR_W-1:0] y0;
-                logic [5:0]      half_exp;
-                // msb_pos is the integer bit position inside the ACC_W word.
-                // The Q-point is at position Q_FRAC (16).
-                // So the value magnitude ~ 2^(msb_pos - Q_FRAC).
-                // 1/sqrt(val) ~ 2^( -(msb_pos - Q_FRAC)/2 )
-                //             = 2^( (Q_FRAC - msb_pos)/2 ) in natural units.
-                // In our NR_FRAC-bit representation this becomes bit position:
-                //   NR_FRAC + (Q_FRAC - msb_pos)/2
-                half_exp = 6'(NR_FRAC) + 6'((6'(Q_FRAC) - s3_msb_pos) >>> 1);
-                y0 = NR_W'(1) << half_exp; // power-of-2 seed
-                s3_y    <= y0;
-                // Pre-compute 0.5 * mean_sq in NR domain.
-                // mean_sq (Q8.16) -> NR domain by scaling up by 2^(NR_FRAC-Q_FRAC)=14
-                // Then take half: >> 1
-                s3_half_mean <= NR_W'(s2_mean_sq >> DIM_LOG2) << (NR_FRAC - Q_FRAC) >> 1;
-                s3_iter <= 1; // reset shift reg
+                // Range reduction and seed
+                int signed    e, k, shift;
+                logic [63:0]  m_fp;     // m in Q2.30 (wide for the shift)
+                logic         next_bit;
+
+                e     = int'(s3_msb_pos) - int'(Q_FRAC);
+                k     = e >>> 1;                               // floor(e/2)
+                // m = mean_sq * 2^(NR_FRAC - Q_FRAC - 2k)
+                shift = int'(NR_FRAC) - int'(Q_FRAC) - 2 * k;
+                if (shift >= 0) m_fp = 64'(s2_mean_sq) << shift;
+                else            m_fp = 64'(s2_mean_sq) >> (-shift);
+                next_bit = (s3_msb_pos > 0) ? s2_mean_sq[s3_msb_pos - 1] : 1'b0;
+
+                s3_y         <= nr_seed(1'(e - 2 * k), next_bit);
+                s3_half_mean <= NR_W'(m_fp >> 1);
+                s3_k         <= 7'(k);
+                s3_iter      <= 1; // reset shift reg
             end else if (state == ST_INVSQRT && !s3_iter[NR_ITERS]) begin
                 // -----------------------------------------------------------
                 // One Newton-Raphson step per clock cycle.
                 //
-                // y_{n+1} = y_n * (3/2 - half_mean * y_n^2)
+                // y_{n+1} = y_n * (3/2 - half_m * y_n^2)
                 //
                 // All values in Q2.30 (NR_W bits).
                 // Multiplications produce 2*NR_W bits; we truncate back to
-                // NR_W by taking bits [2*NR_W-1 : NR_FRAC].
+                // NR_W by shifting right by NR_FRAC.
                 // -----------------------------------------------------------
                 logic [2*NR_W-1:0] yn_sq;       // y_n^2    (Q4.60)
-                logic [2*NR_W-1:0] hm_yn_sq;    // half_mean * y_n^2  (Q4.60 * scale)
+                logic [2*NR_W-1:0] hm_yn_sq;    // half_m * y_n^2
                 logic [NR_W-1:0]   correction;  // 3/2 - hm_yn_sq  (Q2.30)
                 logic [NR_W-1:0]   three_halves;
+                logic [2*NR_W-1:0] y_next;      // y_n * correction (Q4.60)
 
                 three_halves = NR_W'(3) << (NR_FRAC - 1); // 1.5 in Q2.30
 
                 yn_sq      = s3_y * s3_y;                             // Q4.60
                 hm_yn_sq   = (s3_half_mean * NR_W'(yn_sq >> NR_FRAC)) >> NR_FRAC; // back to NR_W
                 correction = three_halves - NR_W'(hm_yn_sq);         // Q2.30
-                // y_{n+1} in Q2.30
-                s3_y       <= NR_W'((s3_y * correction) >> NR_FRAC);
+                // y_{n+1} in Q2.30. The product must be formed at full width
+                // first: inside a cast, s3_y * correction would be
+                // self-determined at NR_W bits and overflow.
+                y_next     = s3_y * correction;
+                s3_y       <= NR_W'(y_next >> NR_FRAC);
                 s3_iter    <= s3_iter << 1; // advance iteration counter
             end else if (state == ST_INVSQRT && s3_iter[NR_ITERS]) begin
-                // Latch final result
-                s3_inv_rms <= s3_y;
+                // Undo the range reduction: 1/RMS = y * 2^-k
+                if (s3_k >= 0) s3_inv_rms <= INV_W'(s3_y) >> s3_k;
+                else           s3_inv_rms <= INV_W'(s3_y) << (-s3_k);
             end
         end
     end
@@ -353,13 +368,13 @@ module rmsnorm_pipeline #(
                 // Retrieve buffered input and gamma for this element
                 automatic logic signed [DATA_W-1:0] xi    = vec_buf[s4_ptr];
                 automatic logic signed [DATA_W-1:0] gi    = gamma_buf[s4_ptr];
+                logic signed [DATA_W-1:0]           normed;  // x_i * inv_rms in Q8.16
 
                 // Step A: xi * inv_rms
                 // xi is signed Q8.16 (25-bit), inv_rms is unsigned Q2.30 (34-bit)
                 // Product is Q10.46, 59-bit; normalise back to Q8.16 by >> 30
                 s4_prod_tmp = $signed({1'b0, s3_inv_rms}) * xi;  // treat inv_rms as unsigned
-                automatic logic signed [DATA_W-1:0] normed =
-                    DATA_W'(s4_prod_tmp >>> NR_FRAC); // keep Q8.16 portion
+                normed = DATA_W'(s4_prod_tmp >>> NR_FRAC); // keep Q8.16 portion
 
                 // Step B: normed * gamma_i
                 // Both Q8.16 (25-bit signed); product Q16.32, 50-bit
@@ -452,101 +467,83 @@ module rmsnorm_pipeline_tb;
     // -----------------------------------------------------------------------
     // Test stimulus
     // -----------------------------------------------------------------------
-    // Input vector [1.0, 2.0, 3.0, 4.0] in Q8.16
-    logic signed [DATA_W-1:0] test_vec[0:DIM-1];
-    logic signed [DATA_W-1:0] test_gamma[0:DIM-1];
+    // Each vector is driven one element per cycle, then the DIM outputs are
+    // collected and compared against an IEEE 754 double-precision reference.
+    // A result passes if it is within 4 LSB or 0.1% of the reference.
+    localparam real TOL_LSB  = 4.0;
+    localparam real TOL_FRAC = 0.001;
 
-    // Reference expected outputs (float, for comparison)
-    real ref_out[0:DIM-1];
+    int fail_count;
 
-    // Collected outputs
-    real       collected[0:DIM-1];
-    int        out_idx;
-    int        fail_count;
+    task automatic run_vector(input string name, input real x[DIM], input real g[DIM]);
+        real sum_sq, rms, ref_out, got, err_lsb, rel_err;
+        int  out_idx;
+        real collected[DIM];
 
-    // Tolerance: accept up to 1% relative error from fixed-point rounding
-    localparam real TOL_FRAC = 0.02; // 2% — Newton-Raphson may have ~1% error
+        sum_sq = 0.0;
+        for (int i = 0; i < DIM; i++) sum_sq += x[i] * x[i];
+        rms = $sqrt(sum_sq / real'(DIM));
+        $display("\n--- Vector '%s': RMS = %0.6f ---", name, rms);
 
-    initial begin
-        // Initialise test vector in Q8.16
-        test_vec[0]   = DATA_W'($rtoi(1.0 * ONE));
-        test_vec[1]   = DATA_W'($rtoi(2.0 * ONE));
-        test_vec[2]   = DATA_W'($rtoi(3.0 * ONE));
-        test_vec[3]   = DATA_W'($rtoi(4.0 * ONE));
-        test_gamma[0] = DATA_W'($rtoi(1.0 * ONE));
-        test_gamma[1] = DATA_W'($rtoi(1.0 * ONE));
-        test_gamma[2] = DATA_W'($rtoi(1.0 * ONE));
-        test_gamma[3] = DATA_W'($rtoi(1.0 * ONE));
+        // Drive input vector — one element per cycle
+        for (int i = 0; i < DIM; i++) begin
+            @(negedge clk); // drive on falling edge, sample on rising
+            in_data  = DATA_W'($rtoi(x[i] * ONE));
+            in_gamma = DATA_W'($rtoi(g[i] * ONE));
+            in_valid = 1;
+        end
+        @(negedge clk);
+        in_valid = 0;
 
-        // Reference (IEEE 754 double precision)
-        begin
-            real sum_sq, rms;
-            sum_sq = 0.0;
-            for (int i = 0; i < DIM; i++)
-                sum_sq += (i+1.0) * (i+1.0);
-            rms = $sqrt(sum_sq / real'(DIM));
-            $display("Reference RMS = %0.6f", rms);
-            for (int i = 0; i < DIM; i++) begin
-                ref_out[i] = (i+1.0) / rms * 1.0; // gamma = 1
-                $display("  ref_out[%0d] = %0.6f  (Q8.16 int ~ %0d)",
-                         i, ref_out[i], $rtoi(ref_out[i] * ONE));
+        // Collect outputs (generous timeout: DIM + pipeline overhead)
+        out_idx = 0;
+        for (int timeout = 0; timeout < 200 && out_idx < DIM; timeout++) begin
+            @(posedge clk); #1;  // sample after the DUT's NBA updates
+            if (out_valid) begin
+                collected[out_idx] = real'($signed(out_data)) / ONE;
+                out_idx++;
             end
         end
+        if (out_idx < DIM) begin
+            $display("  FAIL: only %0d/%0d outputs received", out_idx, DIM);
+            fail_count++;
+        end
 
+        for (int i = 0; i < out_idx; i++) begin
+            ref_out = x[i] / rms * g[i];
+            got     = collected[i];
+            err_lsb = (got - ref_out) * ONE; if (err_lsb < 0.0) err_lsb = -err_lsb;
+            rel_err = (ref_out != 0.0) ? err_lsb / ONE / ((ref_out > 0.0) ? ref_out : -ref_out) : 0.0;
+            if (err_lsb > TOL_LSB && rel_err > TOL_FRAC) begin
+                $display("  FAIL [%0d]: got %9.6f  expected %9.6f  err=%6.1f LSB (%0.4f%%)",
+                         i, got, ref_out, err_lsb, rel_err*100.0);
+                fail_count++;
+            end else begin
+                $display("  PASS [%0d]: got %9.6f  expected %9.6f  err=%6.1f LSB (%0.4f%%)",
+                         i, got, ref_out, err_lsb, rel_err*100.0);
+            end
+        end
+    endtask
+
+    initial begin
         // Reset sequence
         rst_n    = 0;
         in_valid = 0;
         in_data  = '0;
         in_gamma = '0;
-        out_idx  = 0;
         fail_count = 0;
         repeat(4) @(posedge clk);
         rst_n = 1;
         @(posedge clk);
 
-        // Drive input vector — one element per cycle
-        $display("\n--- Driving input vector ---");
-        for (int i = 0; i < DIM; i++) begin
-            @(negedge clk); // drive on falling edge, sample on rising
-            in_data  = test_vec[i];
-            in_gamma = test_gamma[i];
-            in_valid = 1;
-            $display("  Sending x[%0d] = %0.4f  (raw = %0d)",
-                     i, real'(in_data) / ONE, in_data);
-        end
-        @(negedge clk);
-        in_valid = 0;
-
-        // Wait for outputs
-        $display("\n--- Collecting outputs ---");
-        // Generous timeout: DIM + pipeline overhead
-        for (int timeout = 0; timeout < 200; timeout++) begin
-            @(posedge clk);
-            if (out_valid) begin
-                collected[out_idx] = real'($signed(out_data)) / ONE;
-                $display("  out[%0d] = %0.6f  (Q8.16 raw = %0d)  ref = %0.6f",
-                         out_idx, collected[out_idx], out_data, ref_out[out_idx]);
-                out_idx++;
-                if (out_idx == DIM) break;
-            end
-        end
-
-        // Check results
-        $display("\n--- Checking accuracy ---");
-        for (int i = 0; i < DIM; i++) begin
-            real err, rel_err;
-            err     = collected[i] - ref_out[i];
-            if (err < 0.0) err = -err;
-            rel_err = (ref_out[i] > 0.0) ? err / ref_out[i] : err;
-            if (rel_err > TOL_FRAC) begin
-                $display("  FAIL [%0d]: got %0.6f  expected %0.6f  rel_err=%0.4f%%",
-                         i, collected[i], ref_out[i], rel_err*100.0);
-                fail_count++;
-            end else begin
-                $display("  PASS [%0d]: got %0.6f  expected %0.6f  rel_err=%0.4f%%",
-                         i, collected[i], ref_out[i], rel_err*100.0);
-            end
-        end
+        // mean = 7.5  -> k = 1 (odd exponent, upper half of the octave)
+        run_vector("ramp",      '{1.0, 2.0, 3.0, 4.0},     '{1.0, 1.0, 1.0, 1.0});
+        // mean ~ 3350 -> k = 5, mixed signs and non-unit gamma
+        run_vector("large",     '{100.0, -50.0, 0.25, 30.0}, '{1.0, 0.5, 2.0, -1.0});
+        // mean ~ 0.28 -> k = -1 (negative exponent)
+        run_vector("small",     '{0.25, -0.5, 0.75, 0.5},  '{1.0, 1.0, 1.0, 1.0});
+        // mean = 1.0 exactly -> k = 0, seed at the bottom of its interval
+        run_vector("unit",      '{1.0, -1.0, 1.0, -1.0},   '{0.5, 0.5, 0.5, 0.5});
 
         if (fail_count == 0)
             $display("\n=== ALL TESTS PASSED ===\n");

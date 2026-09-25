@@ -44,19 +44,17 @@
 //   3. Normalise by sum to get probabilities in [0.0, 1.0]
 //   4. Convert to Q0.8: output[i] = round(prob[i] * 256), clamped to [0, 255]
 //
-// For compilation:
-//   vlog -sv -dpiheader dpi_header.h softmax_golden.c softmax_tb.sv
+// For compilation (the C model is in softmax_golden.c next to this file), use a
+// simulator with covergroup support, e.g. Questa:
+//   vlog -sv -dpiheader dpi_header.h challenge_02_softmax_testbench.sv softmax_golden.c
+//   vsim -c softmax_testbench -do "run -all"
+//
+// A behavioural softmax_dut stand-in is included at the end of this file so
+// the testbench elaborates and runs out of the box. Replace it with your RTL.
 //
 // =============================================================================
 
 `timescale 1ns/1ps
-
-// DPI-C import: call the C golden model from within SystemVerilog
-import "DPI-C" function void softmax_golden_c(
-    input  shortint input_data[],   // int16_t array
-    output byte     output_data[],  // uint8_t array (byte = 8-bit)
-    input  int      n_elements
-);
 
 // =============================================================================
 // Package: Shared parameters and transaction type
@@ -74,13 +72,28 @@ package softmax_pkg;
   // Set to 1 to allow for rounding differences between C golden model and RTL
   parameter int OUTPUT_TOLERANCE = 1;
 
-  // Transaction: one input vector and its corresponding expected output
-  typedef struct packed {
+  // One DUT output vector, as captured by the monitor
+  typedef logic [7:0] out_vec_t [0:N_ELEMENTS-1];
+
+  // Transaction: one input vector and its corresponding expected output.
+  // Unpacked struct: a packed struct cannot contain unpacked arrays.
+  typedef struct {
     logic signed [15:0] input_vec  [N_ELEMENTS];
     logic        [7:0]  golden_vec [N_ELEMENTS];
   } softmax_txn_t;
 
 endpackage : softmax_pkg
+
+
+// DPI-C import: call the C golden model from within SystemVerilog.
+// Fixed-size arrays are passed to C as plain pointers (const short*, char*),
+// matching the softmax_golden_c() signature. Open arrays ([]) would instead
+// arrive as svOpenArrayHandle.
+import "DPI-C" function void softmax_golden_c(
+    input  shortint input_data  [softmax_pkg::N_ELEMENTS],   // int16_t array
+    output byte     output_data [softmax_pkg::N_ELEMENTS],   // uint8_t array
+    input  int      n_elements
+);
 
 
 // =============================================================================
@@ -94,9 +107,9 @@ interface softmax_if #(
 );
   logic        reset_n;
   logic        input_valid;
-  logic [15:0] input_data  [N];   // unpacked array for easy indexing
+  logic signed [15:0] input_data [N];   // unpacked array for easy indexing
   logic        output_valid;
-  logic [7:0]  output_data [N];
+  logic        [7:0]  output_data [N];
 
   // Clocking block for the driver (drive on negedge, sample on posedge)
   clocking driver_cb @(negedge clk);
@@ -236,10 +249,10 @@ class SoftmaxMonitor;
   virtual softmax_if vif;
 
   // FIFO to pass captured outputs to the scoreboard
-  mailbox #(logic [7:0][softmax_pkg::N_ELEMENTS-1:0]) out_fifo;
+  mailbox #(softmax_pkg::out_vec_t) out_fifo;
 
   function new(virtual softmax_if vif,
-               mailbox #(logic [7:0][softmax_pkg::N_ELEMENTS-1:0]) out_fifo);
+               mailbox #(softmax_pkg::out_vec_t) out_fifo);
     this.vif      = vif;
     this.out_fifo = out_fifo;
   endfunction
@@ -273,7 +286,7 @@ class SoftmaxScoreboard;
 
   // FIFOs connecting to driver (expected) and monitor (actual)
   mailbox #(softmax_pkg::softmax_txn_t)                  txn_fifo;
-  mailbox #(logic [7:0][softmax_pkg::N_ELEMENTS-1:0])    out_fifo;
+  mailbox #(softmax_pkg::out_vec_t)    out_fifo;
 
   // Statistics
   int total_checks  = 0;
@@ -282,7 +295,7 @@ class SoftmaxScoreboard;
 
   function new(
       mailbox #(softmax_pkg::softmax_txn_t) txn_fifo,
-      mailbox #(logic [7:0][softmax_pkg::N_ELEMENTS-1:0]) out_fifo
+      mailbox #(softmax_pkg::out_vec_t) out_fifo
   );
     this.txn_fifo = txn_fifo;
     this.out_fifo  = out_fifo;
@@ -308,8 +321,7 @@ class SoftmaxScoreboard;
 
         if (diff > softmax_pkg::OUTPUT_TOLERANCE) begin
           if (!txn_error) begin
-            $error("[Scoreboard] Mismatch on transaction %0d at element %0d: "
-                   "DUT=%0d, expected=%0d, diff=%0d",
+            $error("[Scoreboard] Mismatch on transaction %0d at element %0d: DUT=%0d, expected=%0d, diff=%0d",
                    total_checks, i, dut_output[i], txn.golden_vec[i], diff);
             $display("  Input vector: ");
             for (int j = 0; j < N; j++)
@@ -332,7 +344,7 @@ class SoftmaxScoreboard;
 
   function void report();
     $display("");
-    $display("=" * 60);
+    $display({60{"="}});
     $display("[Scoreboard] Final Report");
     $display("  Total transactions  : %0d", total_checks);
     $display("  Errors (diff > %0d) : %0d", softmax_pkg::OUTPUT_TOLERANCE, total_errors);
@@ -341,7 +353,7 @@ class SoftmaxScoreboard;
       $display("  RESULT: PASS");
     else
       $display("  RESULT: FAIL");
-    $display("=" * 60);
+    $display({60{"="}});
   endfunction
 
 endclass : SoftmaxScoreboard
@@ -353,14 +365,14 @@ endclass : SoftmaxScoreboard
 
 class SoftmaxCoverage;
 
-  // Sampled each time a new input vector is driven
-  logic signed [15:0] sample_input [softmax_pkg::N_ELEMENTS];
-
+  // Summary statistics of the most recent input vector (sampled each time a
+  // new input vector is driven)
   // Track the maximum and minimum values in the input vector
   logic signed [15:0] vec_max;
   logic signed [15:0] vec_min;
   int                 vec_range;   // max - min (spread of the distribution)
   int                 n_zeros;     // number of zero elements in the vector
+  logic [7:0]         first_out_elem;  // representative output element
 
   covergroup softmax_input_cg;
 
@@ -409,8 +421,7 @@ class SoftmaxCoverage;
 
     // Sampled output (track which output bins are hit)
     // In practice, we sample the first element of the output as a representative
-    logic [7:0] first_out_elem;  // set before sampling
-
+    // (first_out_elem is a class member: covergroups cannot declare variables)
     cp_output_value: coverpoint first_out_elem {
       bins zero          = {8'h00};         // probability ≈ 0
       bins low_prob      = {[8'h01:8'h0F]}; // < 6%
@@ -444,7 +455,7 @@ class SoftmaxCoverage;
   endfunction
 
   function void sample_output(logic [7:0] out_vec[softmax_pkg::N_ELEMENTS]);
-    softmax_output_cg.first_out_elem = out_vec[0];
+    first_out_elem = out_vec[0];
     softmax_output_cg.sample();
   endfunction
 
@@ -499,13 +510,25 @@ module softmax_testbench;
   // Testbench component instantiation
   // -------------------------------------------------------------------------
   // Shared mailboxes (TLM-lite channels)
-  mailbox #(softmax_txn_t)                   sb_txn_fifo  = new();
-  mailbox #(logic [7:0][N_ELEMENTS-1:0])     sb_out_fifo  = new();
+  mailbox #(softmax_txn_t)  sb_txn_fifo;
+  mailbox #(out_vec_t)      sb_out_fifo;
 
-  SoftmaxDriver      driver      = new(dut_if, sb_txn_fifo);
-  SoftmaxMonitor     monitor     = new(dut_if, sb_out_fifo);
-  SoftmaxScoreboard  scoreboard  = new(sb_txn_fifo, sb_out_fifo);
-  SoftmaxCoverage    cov_model   = new();
+  SoftmaxDriver      driver;
+  SoftmaxMonitor     monitor;
+  SoftmaxScoreboard  scoreboard;
+  SoftmaxCoverage    cov_model;
+
+  // Build the components at time 0, in dependency order. (Constructing them
+  // in their declarations would rely on the order of static initialisers,
+  // which the LRM leaves undefined: a driver could be handed a null mailbox.)
+  initial begin
+    sb_txn_fifo = new();
+    sb_out_fifo = new();
+    driver      = new(dut_if, sb_txn_fifo);
+    monitor     = new(dut_if, sb_out_fifo);
+    scoreboard  = new(sb_txn_fifo, sb_out_fifo);
+    cov_model   = new();
+  end
 
   // -------------------------------------------------------------------------
   // Reset sequence
@@ -587,43 +610,68 @@ endmodule : softmax_testbench
 
 
 // =============================================================================
-// Stub: C golden model (softmax_golden.c)
+// Stand-in DUT: behavioural softmax reference (replace with your RTL)
 // =============================================================================
 //
-// Compile this as a separate .c file linked with DPI-C.
-// Shown here as a comment block for reference.
-//
-// ----- softmax_golden.c -----
-//
-// #include <stdint.h>
-// #include <math.h>
-// #include <string.h>
-//
-// // Numerically stable softmax: subtract max before exp.
-// // Output is Q0.8 fixed-point: value = round(probability * 256), clamped [0,255].
-// void softmax_golden_c(const int16_t *input, uint8_t *output, int n) {
-//     float exp_vals[n];
-//     float sum = 0.0f;
-//     int16_t max_val = input[0];
-//
-//     // Find max for numerical stability
-//     for (int i = 1; i < n; i++)
-//         if (input[i] > max_val) max_val = input[i];
-//
-//     // Compute exp(x - max) and accumulate sum
-//     for (int i = 0; i < n; i++) {
-//         exp_vals[i] = expf((float)(input[i] - max_val));
-//         sum += exp_vals[i];
-//     }
-//
-//     // Normalise and convert to Q0.8
-//     for (int i = 0; i < n; i++) {
-//         float prob = exp_vals[i] / sum;
-//         int rounded = (int)(prob * 256.0f + 0.5f);  // RHAFZ
-//         if (rounded > 255) rounded = 255;
-//         if (rounded < 0)   rounded = 0;
-//         output[i] = (uint8_t)rounded;
-//     }
-// }
-//
-// ----------------------------
+// Computes the same numerically stable softmax as the C golden model, in
+// double precision, and delays the result by PIPE_LATENCY cycles so the
+// testbench sees a DUT with the documented interface and timing. It is not
+// synthesisable: it exists so the testbench can be compiled and run on its
+// own before a real softmax RTL is connected.
+// =============================================================================
+
+module softmax_dut #(
+    parameter int N_ELEMENTS   = 16,
+    parameter int PIPE_LATENCY = 4
+) (
+    input  logic               clk,
+    input  logic               reset_n,
+    input  logic               input_valid,
+    input  logic signed [15:0] input_data  [N_ELEMENTS],
+    output logic               output_valid,
+    output logic        [7:0]  output_data [N_ELEMENTS]
+);
+
+  logic       valid_pipe [PIPE_LATENCY];
+  logic [7:0] data_pipe  [PIPE_LATENCY][N_ELEMENTS];
+
+  function automatic void softmax_q08(input  logic signed [15:0] x [N_ELEMENTS],
+                                      output logic        [7:0]  y [N_ELEMENTS]);
+    real e [N_ELEMENTS];
+    real sum;
+    int  max_val, q;
+    max_val = x[0];
+    for (int i = 1; i < N_ELEMENTS; i++)
+      if (x[i] > max_val) max_val = x[i];
+    sum = 0.0;
+    for (int i = 0; i < N_ELEMENTS; i++) begin
+      e[i] = $exp(real'(int'(x[i]) - max_val));
+      sum += e[i];
+    end
+    for (int i = 0; i < N_ELEMENTS; i++) begin
+      q = $rtoi(e[i] / sum * 256.0 + 0.5);
+      y[i] = (q > 255) ? 8'd255 : 8'(q);
+    end
+  endfunction
+
+  always_ff @(posedge clk) begin
+    if (!reset_n) begin
+      for (int s = 0; s < PIPE_LATENCY; s++) valid_pipe[s] <= 1'b0;
+    end else begin
+      valid_pipe[0] <= input_valid;
+      if (input_valid) begin
+        logic [7:0] y [N_ELEMENTS];
+        softmax_q08(input_data, y);
+        data_pipe[0] <= y;
+      end
+      for (int s = 1; s < PIPE_LATENCY; s++) begin
+        valid_pipe[s] <= valid_pipe[s-1];
+        data_pipe[s]  <= data_pipe[s-1];
+      end
+    end
+  end
+
+  assign output_valid = valid_pipe[PIPE_LATENCY-1];
+  assign output_data  = data_pipe[PIPE_LATENCY-1];
+
+endmodule : softmax_dut

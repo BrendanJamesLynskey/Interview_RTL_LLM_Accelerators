@@ -14,12 +14,15 @@
 //
 // ALGORITHM
 // ---------
-//   Input:  x in fixed-point Q4.12 (signed), range approximately [-8, 8)
-//   Output: e^x in fixed-point Q8.8 (unsigned), range [0, 255.996)
+//   Input:  x in fixed-point Q4.12 (signed); the LUT covers [-8, 8)
+//   Output: e^x in fixed-point Q8.8 (unsigned), range [0, 255.996).
+//           e^x exceeds the Q8.8 range for x > ln(255.996) ~= 5.545, so the
+//           output saturates to 16'hFFFF above that point.
 //
-//   1. Decompose x into an integer-aligned LUT index and a fractional remainder:
-//        idx  = x[IN_W-1 : IN_FRAC - LUT_ADDR_W]   (top address bits)
-//        frac = x[IN_FRAC - LUT_ADDR_W - 1 : 0]     (sub-step fractional bits)
+//   1. Offset x so that LUT_X_MIN maps to zero: u = x - LUT_X_MIN (unsigned,
+//      SPAN_BITS = log2(16 * 4096) = 16 bits wide). Then split u:
+//        idx  = u[SPAN_BITS-1 : FRAC_BITS]   (top LUT_ADDR_W bits)
+//        frac = u[FRAC_BITS-1 : 0]           (FRAC_BITS = 16 - 8 = 8 bits)
 //
 //   2. Look up two adjacent LUT entries: lut[idx] and lut[idx+1]
 //
@@ -108,8 +111,12 @@ module exp_lut_interpolation #(
     // -----------------------------------------------------------------------
     localparam real LUT_RANGE   = LUT_X_MAX - LUT_X_MIN;   // 16.0
     localparam real LUT_STEP    = LUT_RANGE / real'(LUT_DEPTH); // 16/256 = 0.0625
-    // Number of sub-step fraction bits remaining after the LUT index
-    localparam int unsigned FRAC_BITS = IN_FRAC - LUT_ADDR_W; // 12 - 8 = 4
+    // Width of the offset input u = x - LUT_X_MIN over the LUT range:
+    // 16.0 * 2^12 = 65536 codes -> 16 bits
+    localparam int unsigned SPAN_BITS = $clog2($rtoi(LUT_RANGE * (2.0 ** IN_FRAC)));
+    // Sub-step fraction bits left below the LUT index. Each LUT step is
+    // 2^FRAC_BITS input LSBs: 2^8 / 4096 = 0.0625 = LUT_STEP
+    localparam int unsigned FRAC_BITS = SPAN_BITS - LUT_ADDR_W; // 16 - 8 = 8
 
     // Scale factor to convert LUT output to Q8.8
     localparam real OUT_SCALE   = 2.0 ** OUT_FRAC;          // 256.0
@@ -130,9 +137,9 @@ module exp_lut_interpolation #(
             // e^x in Q8.8; clamp to OUT_W max if it overflows
             localparam real exp_val_f = $exp(x_val) * OUT_SCALE;
             localparam real max_val_f = (2.0 ** OUT_W) - 1.0;
-            // Use min() to clamp — $rtoi truncates towards zero
+            // Clamp, then round to nearest ($rtoi alone truncates towards zero)
             localparam real clamped   = (exp_val_f < max_val_f) ? exp_val_f : max_val_f;
-            initial lut_rom[i] = OUT_W'($rtoi(clamped));
+            initial lut_rom[i] = OUT_W'($rtoi(clamped + 0.5));
         end
     endgenerate
 
@@ -154,7 +161,7 @@ module exp_lut_interpolation #(
 
     // Clamp boundaries before indexing
     localparam int signed X_MIN_FP = $rtoi(LUT_X_MIN * (2.0 ** IN_FRAC)); // -32768
-    localparam int signed X_MAX_FP = $rtoi((LUT_X_MAX - LUT_STEP) * (2.0 ** IN_FRAC)); // just below +8.0
+    localparam int signed X_MAX_FP = $rtoi(LUT_X_MAX * (2.0 ** IN_FRAC)) - 1; // 1 LSB below +8.0 (guard entry covers the last step)
 
     logic signed [IN_W-1:0]      s1_x_clamped;    // clamped input
     logic [LUT_ADDR_W-1:0]       s1_lut_idx;      // LUT base index
@@ -170,8 +177,11 @@ module exp_lut_interpolation #(
         end else begin
             s1_valid <= valid_in;
             if (valid_in) begin
-                // Clamp to LUT range
+                // Declarations must precede statements in a begin-end block
                 logic signed [IN_W-1:0] x_clamped;
+                logic [IN_W:0]          x_unsigned;  // IN_W+1 bits: holds the offset sum
+
+                // Clamp to LUT range
                 if      (x_in < IN_W'(X_MIN_FP)) x_clamped = IN_W'(X_MIN_FP);
                 else if (x_in > IN_W'(X_MAX_FP)) x_clamped = IN_W'(X_MAX_FP);
                 else                              x_clamped = x_in;
@@ -179,16 +189,13 @@ module exp_lut_interpolation #(
                 // Shift to unsigned: x_unsigned = x_clamped + OFFSET_FP
                 // OFFSET_FP is always positive so the result is unsigned.
                 // Width: IN_W+1 to hold the addition without overflow.
-                logic [IN_W:0] x_unsigned;
                 x_unsigned = IN_W'(x_clamped) + IN_W'(OFFSET_FP);
 
-                // Top LUT_ADDR_W bits of the fraction field are the index
-                // The input fraction field occupies bits [IN_FRAC-1:0].
-                // After adding OFFSET_FP the index sits at bits
-                //   [IN_FRAC-1 + ceiling : IN_FRAC - LUT_ADDR_W]
-                // For our parameters: index = bits [IN_FRAC-1 : FRAC_BITS]
-                //                     frac  = bits [FRAC_BITS-1 : 0]
-                s1_lut_idx   <= x_unsigned[IN_FRAC-1 -: LUT_ADDR_W];
+                // After adding OFFSET_FP, x_unsigned spans SPAN_BITS bits.
+                // The top LUT_ADDR_W bits select the LUT step; the rest are
+                // the position within that step.
+                // For our parameters: index = bits [15:8], frac = bits [7:0]
+                s1_lut_idx   <= x_unsigned[SPAN_BITS-1 -: LUT_ADDR_W];
                 s1_frac      <= x_unsigned[FRAC_BITS-1:0];
                 s1_x_clamped <= x_clamped;
             end
@@ -237,21 +244,22 @@ module exp_lut_interpolation #(
         end else begin
             valid_out <= s2_valid;
             if (s2_valid) begin
+                logic signed [OUT_W:0]           delta;
+                logic signed [FRAC_BITS+OUT_W:0] interp_prod;
+                logic signed [OUT_W:0]           interp_term;
+                logic signed [OUT_W+1:0]         result_full;
+
                 // Compute delta = lut1 - lut0 (signed; lut1 >= lut0 for e^x)
-                logic signed [OUT_W:0] delta;
                 delta = $signed({1'b0, s2_lut1}) - $signed({1'b0, s2_lut0});
 
                 // frac * delta: frac is unsigned FRAC_BITS; delta is signed OUT_W+1
                 // Product is signed FRAC_BITS+OUT_W+1 bits
-                logic signed [FRAC_BITS+OUT_W:0] interp_prod;
                 interp_prod = $signed({1'b0, s2_frac}) * delta;
 
                 // Divide by 2^FRAC_BITS (the interpolation denominator)
-                logic signed [OUT_W:0] interp_term;
                 interp_term = interp_prod >>> FRAC_BITS;
 
                 // Add to base LUT entry and clamp to OUT_W unsigned
-                logic signed [OUT_W+1:0] result_full;
                 result_full = $signed({1'b0, s2_lut0}) + $signed({interp_term[OUT_W], interp_term});
 
                 // Clamp: result should always be positive for e^x, but guard anyway
@@ -279,8 +287,10 @@ endmodule
 // times the step size: max_err ≈ 0.5 * e^8 * (16/256)^2 / 2 ≈ 4.1
 // in real units.  In Q8.8 terms that is about 1050 LSBs near x=8.
 // For small x the absolute error is much less (e^0=1, step error ~0.0002).
-// The test uses a 2% relative tolerance which is generous for x near 0
-// and tighter in absolute terms than the worst case at x=8.
+// The reference is e^x in Q8.8, saturated at 16'hFFFF like the DUT. A result
+// passes if it is within 2 LSB (covers LUT and output quantisation, which
+// dominates for small e^x) OR within 0.5% (covers large e^x; the linear-
+// interpolation error for step h = 1/16 is at most h^2/8 ~= 0.05%).
 // =============================================================================
 module exp_lut_interpolation_tb;
 
@@ -348,29 +358,52 @@ module exp_lut_interpolation_tb;
 
     // --- Error tracking ---
     real max_abs_err, max_rel_err;
+    localparam real MAX_Q   = (2.0 ** OUT_W) - 1.0;  // saturation value
+    localparam real TOL_LSB = 2.0;
+    localparam real TOL_REL = 0.005;
+
+    // Ideal e^x in Q8.8 LSBs, saturated like the hardware
+    function automatic real ideal_q(real xval);
+        real q;
+        q = $exp(xval) * OUT_SCALE;
+        return (q > MAX_Q) ? MAX_Q : q;
+    endfunction
+
+    function automatic bit within_tol(real got_q, real want_q);
+        real abs_err;
+        abs_err = got_q - want_q; if (abs_err < 0.0) abs_err = -abs_err;
+        return (abs_err <= TOL_LSB) || (abs_err <= TOL_REL * want_q);
+    endfunction
     int  max_abs_err_idx, max_rel_err_idx;
 
     // Specific spot-check values for boundary / interesting points
     task automatic spot_check(real xval, string label);
-        real ideal_f, got_f, abs_err, rel_err;
+        real want_q, got_q;
         logic signed [IN_W-1:0] x_fp;
-        x_fp    = IN_W'($rtoi(xval * IN_SCALE));
-        ideal_f = $exp(xval);
+        bit seen;
+        x_fp   = IN_W'($rtoi(xval * IN_SCALE));
+        want_q = ideal_q(xval);
         @(negedge clk);
         x_in    = x_fp;
         valid_in = 1;
         @(negedge clk);
         valid_in = 0;
-        // Wait 3 pipeline stages + margin
-        repeat(5) @(posedge clk);
-        @(posedge clk);
-        if (valid_out) begin
-            got_f   = real'(exp_out) / OUT_SCALE;
-            abs_err = got_f - ideal_f; if (abs_err < 0.0) abs_err = -abs_err;
-            rel_err = (ideal_f > 1e-6) ? abs_err / ideal_f : abs_err;
-            $display("  %s: x=%6.3f  ideal=%8.4f  got=%8.4f  abs_err=%7.4f  rel_err=%5.2f%%",
-                     label, xval, ideal_f, got_f, abs_err, rel_err*100.0);
+        // valid_out is a one-cycle pulse, so catch it rather than sampling late
+        seen = 0;
+        for (int c = 0; c < 8 && !seen; c++) begin
+            @(posedge clk); #1;
+            if (valid_out) seen = 1;
         end
+        if (!seen) begin
+            $display("  %s: *** FAIL: no valid_out ***", label);
+            fail_count++;
+            return;
+        end
+        got_q = real'(exp_out);
+        $display("  %s: x=%6.3f  ideal=%9.4f  got=%9.4f  (Q8.8 LSBs: ideal %8.1f, got %6.0f)%s",
+                 label, xval, want_q / OUT_SCALE, got_q / OUT_SCALE, want_q, got_q,
+                 within_tol(got_q, want_q) ? "" : "  *** FAIL ***");
+        if (!within_tol(got_q, want_q)) fail_count++;
     endtask
 
     initial begin
@@ -429,7 +462,7 @@ module exp_lut_interpolation_tb;
             begin
                 // Wait for first valid output (pipeline latency = 3 cycles)
                 for (int timeout = 0; timeout < 200; timeout++) begin
-                    @(posedge clk);
+                    @(posedge clk); #1;  // sample after the DUT's NBA updates
                     if (valid_out && recv_ptr < NUM_TESTS) begin
                         received_out[recv_ptr] = int'(exp_out);
                         recv_ptr++;
@@ -441,7 +474,7 @@ module exp_lut_interpolation_tb;
 
         // Wait any remaining outputs
         for (int timeout = 0; timeout < 20 && recv_ptr < NUM_TESTS; timeout++) begin
-            @(posedge clk);
+            @(posedge clk); #1;
             if (valid_out && recv_ptr < NUM_TESTS) begin
                 received_out[recv_ptr] = int'(exp_out);
                 recv_ptr++;
@@ -453,13 +486,13 @@ module exp_lut_interpolation_tb;
         $display("  %6s  %8s  %8s  %8s  %7s  %7s",
                  "x", "ideal", "ideal_q", "got_q", "abs_err", "rel_err%");
         for (int i = 0; i < recv_ptr; i++) begin
-            real ideal_q, got_q, abs_err, rel_err;
-            ideal_q = expected_f[i] * OUT_SCALE;  // ideal in Q8.8 integer units
+            real want_q, got_q, abs_err, rel_err;
+            want_q  = ideal_q(test_x_real[i]);    // ideal in Q8.8 LSBs, saturated
             got_q   = real'(received_out[i]);
-            abs_err = got_q - ideal_q; if (abs_err < 0.0) abs_err = -abs_err;
-            rel_err = (ideal_q > 0.5) ? abs_err / ideal_q : abs_err;
+            abs_err = got_q - want_q; if (abs_err < 0.0) abs_err = -abs_err;
+            rel_err = (want_q > 0.5) ? abs_err / want_q : abs_err;
             $display("  %6.2f  %8.4f  %8.0f  %8d  %7.1f  %6.2f%%",
-                     test_x_real[i], expected_f[i], ideal_q,
+                     test_x_real[i], expected_f[i], want_q,
                      received_out[i], abs_err, rel_err*100.0);
             if (abs_err > max_abs_err) begin
                 max_abs_err     = abs_err;
@@ -469,9 +502,9 @@ module exp_lut_interpolation_tb;
                 max_rel_err     = rel_err;
                 max_rel_err_idx = i;
             end
-            // Fail if relative error > 5% (very generous for a 256-entry LUT)
-            if (rel_err > 0.05 && expected_f[i] > 0.01) begin
-                $display("    *** FAIL: rel_err exceeds 5%% threshold ***");
+            if (!within_tol(got_q, want_q)) begin
+                $display("    *** FAIL: error exceeds %.0f LSB and %.1f%% ***",
+                         TOL_LSB, TOL_REL * 100.0);
                 fail_count++;
             end
         end
