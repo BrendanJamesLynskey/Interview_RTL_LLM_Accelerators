@@ -28,6 +28,7 @@ Topics covered include:
 - [07 - Verification](#07---verification)
 - [08 - Quizzes](#08---quizzes)
 - [How to Use](#how-to-use)
+- [Simulating the SystemVerilog Challenges](#simulating-the-systemverilog-challenges)
 - [Related Repositories](#related-repositories)
 - [Contributing](#contributing)
 - [License](#license)
@@ -132,6 +133,72 @@ This repository is designed as an interview preparation guide for RTL design eng
 7. **Self-assess**: Use the quizzes in section 08 to identify weak areas and revisit relevant sections.
 
 **Study approach**: This is not a walkthrough of an existing codebase. Instead, each section presents design decisions, trade-offs, and implementation considerations. Use this to build mental models during interview preparation, then reason through new problems from first principles.
+
+## Simulating the SystemVerilog Challenges
+
+Every `.sv` coding challenge here is a design plus a self-checking testbench in one file. All fourteen have been simulated and pass (September 2026) and are clean in slang: five in Verilator, nine in the Vivado simulator (xsim), which is the only free simulator that can run them. The Python golden model in `07_verification` needs Python 3 with NumPy.
+
+| Challenge | Testbench top | Passes in | Verilator 5.020 | Icarus 12 |
+|-----------|---------------|-----------|-----------------|-----------|
+| `02_datapath_design/…/challenge_01_systolic_array.sv` | `tb_systolic_array` | **xsim 2025.2** | ✗ `disable` of a named block from another `fork` branch | ✗ unpacked-array task/function ports |
+| `02_datapath_design/…/challenge_02_mac_unit_fp16_int8.sv` | `tb_mac_unit_mixed_precision` | **xsim 2025.2** | ✗ fixed array passed to an open-array `[]` argument (C++ compile error) | ✗ `break` |
+| `02_datapath_design/…/challenge_03_accumulator_tree.sv` | `tb_accumulator_tree` | Verilator 5.020 | ✓ | ✗ unpacked-array task ports |
+| `03_attention_engine/…/challenge_01_softmax_pipeline.sv` | `tb_softmax_pipeline` (`-d SIMULATION`) | **xsim 2025.2** | ✗ named `disable` across `fork` branches | ✗ `automatic` lifetime override |
+| `03_attention_engine/…/challenge_02_kv_cache_controller.sv` | `tb_kv_cache_controller` (`-d SIMULATION`) | **xsim 2025.2** | ✗ named `disable` across `fork` branches | ✗ named task arguments `.t(…)` |
+| `03_attention_engine/…/challenge_03_rope_unit.sv` | `tb_rope_unit` (`-d SIMULATION`) | **xsim 2025.2** | ✗ named `disable` across `fork` branches | ✗ unpacked-array task ports |
+| `04_memory_and_dataflow/…/challenge_01_tile_scheduler.sv` | `tb_tile_scheduler` | **xsim 2025.2** | ✗ `disable` of named `fork` blocks | ✗ concurrent assertions; unpacked structs |
+| `04_memory_and_dataflow/…/challenge_02_double_buffer_controller.sv` | `tb_double_buffer_controller` | **xsim 2025.2** | ✗ `disable` of named `fork` blocks | ✗ concurrent assertions |
+| `04_memory_and_dataflow/…/challenge_03_axi_dma_engine.sv` | `tb_axi_dma_engine` | Verilator 5.020 | ✓ | ✗ `automatic` lifetime override |
+| `05_nonlinear_and_normalisation/…/challenge_01_gelu_approximation.sv` | `tb_gelu_approximation` | Verilator 5.020 | ✓ | ✗ unpacked-array `localparam` with an initialiser |
+| `05_nonlinear_and_normalisation/…/challenge_02_rmsnorm_pipeline.sv` | `rmsnorm_pipeline_tb` | Verilator 5.020 | ✓ | ✗ `automatic` lifetime override |
+| `05_nonlinear_and_normalisation/…/challenge_03_exp_lut_interpolation.sv` | `exp_lut_interpolation_tb` | Verilator 5.020 | ✓ | ✗ `break` |
+| `07_verification/…/challenge_02_softmax_testbench.sv` | `softmax_testbench` | **xsim 2025.2** + DPI-C (`softmax_golden.c`) | ✗ “Unsupported: covergroup”; virtual-interface / clocking-block failures | ✗ unpacked structs |
+| `07_verification/…/challenge_03_coverage_plan.sv` | `coverage_plan_tb` | **xsim 2025.2** | ✗ “Unsupported: covergroup” | ✗ interface as a module port |
+
+### Tools, and why each was needed
+
+| Tool | Version used | Used for | Why it was needed |
+|------|--------------|----------|-------------------|
+| **slang** (`pip install pyslang`) | pyslang 11.0 | Legality check of every `.sv` file | A complete IEEE 1800-2017 front end: it finds code that is not legal SystemVerilog, with exact line numbers, in seconds. It does **not** simulate, so it cannot find functional bugs — and it passed a few illegal constructs that xsim rejected (an `always_ff` variable with a second driver, use before declaration, an out-of-range constant index) |
+| **Verilator** | 5.020 (Ubuntu 24.04 package, `--binary --timing --assert`) | Simulating the synthesisable-style challenges with procedural testbenches | Free, fast, and supports what those testbenches use (delays, `fork`, `\|=>`/`$past` assertions). It cannot run the rest: no covergroups, no `##` in sequences, no `disable` of a named block from another `fork` branch, and failures on parameterised virtual interfaces / clocking blocks |
+| **AMD Vivado simulator (xsim)** | Vivado 2025.2 (free ML Standard edition) | Simulating the challenges Verilator and Icarus cannot run | The only free simulator available that supports classes, mailboxes, virtual interfaces with clocking blocks, covergroups, `##` sequences, named `disable`, array arguments and DPI-C together |
+| Icarus Verilog | 12.0 | Tried on every file | Compiles none of these fourteen: it rejects unpacked-array task ports, `break`, concurrent assertions, `automatic` lifetime overrides, named task arguments, unpacked structs, interface ports and initialised unpacked-array `localparam`s (see the table) |
+
+### Commands
+
+slang (legality):
+```bash
+python3 -c "from pyslang.syntax import SyntaxTree; from pyslang.ast import Compilation
+c = Compilation(); c.addSyntaxTree(SyntaxTree.fromFile('<challenge>.sv'))
+print([str(d.code) for d in c.getAllDiagnostics() if d.isError()])"   # [] = clean
+```
+
+Verilator (the five plain-RTL challenges):
+```bash
+verilator --binary --timing --assert -Wno-fatal -Wno-lint -Wno-style -Wno-WIDTH \
+          -j 1 --top-module <tb_top> <challenge>.sv && obj_dir/V<tb_top>
+```
+(`-j 1`: parallel builds of 5.020 crash intermittently.)
+
+xsim (the other nine):
+```bash
+source /opt/Xilinx/2025.2/Vivado/settings64.sh     # puts xvlog / xelab / xsim / xsc on PATH
+mkdir work && cd work                              # one work directory per design
+xvlog -sv [-d SIMULATION] <challenge>.sv           # -d SIMULATION where the TB is inside `ifdef SIMULATION
+xelab <tb_top> -s snap
+xsim snap -R
+```
+
+For the UVM-lite softmax testbench, build the DPI-C golden model first and link it:
+```bash
+xsc softmax_golden.c                               # builds xsim.dir/work/xsc/dpi.so
+xvlog -sv challenge_02_softmax_testbench.sv
+xelab softmax_testbench -sv_lib dpi -s snap && xsim snap -R
+```
+
+xsim 2025.2 quirks these files work around: `$urandom(seed)` as a statement is rejected (the UVM-lite testbench seeds with `process::self().srandom(seed)`); `shortreal` is held at double precision (the MAC reference rounds each step through `$shortrealtobits`); `iff` on `illegal_bins`/`ignore_bins` is ignored (the coverage plan checks its NaN rule with an assertion); `option.cross_auto_bin_max` is rejected (an `ignore_bins` complement is used). Also avoid size casts such as `16'(a - b)` in continuous assignments: xsim does not truncate them.
+
+The full construct-by-construct comparison, with every error message, is in the [SystemVerilog_Simulators](https://github.com/BrendanJamesLynskey/SystemVerilog_Simulators) presentation.
 
 ## Related Repositories
 
