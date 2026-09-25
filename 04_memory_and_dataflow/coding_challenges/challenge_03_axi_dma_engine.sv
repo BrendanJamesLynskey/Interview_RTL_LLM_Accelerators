@@ -171,11 +171,18 @@ module axi_dma_engine #(
 
     // Current burst beat count (0-indexed)
     logic [7:0]             beat_cnt;
-    logic [7:0]             cur_burst_beats; // Number of beats in this burst
+    logic [7:0]             cur_burst_beats; // Beats for the next burst (from bytes_remaining)
+    logic [7:0]             burst_beats_reg; // Beats in the burst in flight (latched at start;
+                                             // cur_burst_beats changes as bytes_remaining drops)
 
-    // Scratchpad read buffer for STORE direction
+
+    // Scratchpad read buffer for STORE direction. The scratchpad has a
+    // one-cycle synchronous read: data requested with sp_ren appears on
+    // sp_rdata on the following cycle, flagged by rd_pending.
     logic [AXI_DATA_W-1:0] sp_rdata_buf;
     logic                   sp_rdata_valid;
+    logic                   rd_pending;
+    logic                   w_beat;          // W handshake this cycle
 
     // -------------------------------------------------------------------------
     // Burst beat calculation
@@ -198,10 +205,23 @@ module axi_dma_engine #(
             bytes_remaining  <= '0;
             burst_len_reg    <= '0;
             beat_cnt         <= '0;
+            burst_beats_reg  <= '0;
             sp_rdata_buf     <= '0;
             sp_rdata_valid   <= 1'b0;
+            rd_pending       <= 1'b0;
         end else begin
             state <= next_state;
+
+            // Scratchpad read pipeline (STORE): capture data one cycle after
+            // the read was issued; a W beat consumes the buffered word.
+            rd_pending <= sp_ren;
+            if (rd_pending) begin
+                sp_rdata_buf   <= sp_rdata;
+                sp_rdata_valid <= 1'b1;
+            end else if (w_beat) begin
+                sp_rdata_valid <= 1'b0;
+            end
+
 
             case (state)
                 S_IDLE: begin
@@ -235,33 +255,23 @@ module axi_dma_engine #(
                     end
                 end
 
-                // STORE: Initiate scratchpad read, then issue AW
+                // STORE: start of a burst -- the first scratchpad read is
+                // issued this cycle (see sp_ren); latch the burst length
                 S_STORE_AR_READ: begin
-                    // sp_rdata is available next cycle after sp_ren
-                    sp_rdata_buf   <= sp_rdata;
-                    sp_rdata_valid <= 1'b1;
+                    burst_beats_reg <= cur_burst_beats;
+                    beat_cnt        <= '0;
                 end
 
-                S_STORE_AW: begin
-                    if (m_axi_awvalid && m_axi_awready) begin
-                        beat_cnt <= '0;
-                    end
-                end
+                S_STORE_AW: ;  // first word arrives in the buffer meanwhile
 
                 S_STORE_W: begin
-                    if (m_axi_wvalid && m_axi_wready) begin
+                    if (w_beat) begin
                         beat_cnt        <= beat_cnt + 1'b1;
                         sp_addr_reg     <= sp_addr_reg + SP_ADDR_W'(BYTES_PER_BEAT);
                         bytes_remaining <= bytes_remaining - 24'(BYTES_PER_BEAT);
                         sys_addr_reg    <= sys_addr_reg + AXI_ADDR_W'(BYTES_PER_BEAT);
-                        // Pre-fetch next scratchpad word
-                        sp_rdata_buf    <= sp_rdata;
-                        sp_rdata_valid  <= 1'b1;
-
-                        if (m_axi_wlast) begin
-                            beat_cnt       <= '0;
-                            sp_rdata_valid <= 1'b0;
-                        end
+                        if (m_axi_wlast)
+                            beat_cnt <= '0;
                     end
                 end
 
@@ -353,10 +363,16 @@ module axi_dma_engine #(
     assign m_axi_awburst = 2'b01;
     assign m_axi_awvalid = (state == S_STORE_AW);
 
-    // W channel
+    // W channel. WLAST uses the burst length latched at burst start: the
+    // live cur_burst_beats shrinks as bytes_remaining counts down, so
+    // comparing against it would never match on the final burst.
+    // Each beat needs a fresh scratchpad read, so WVALID drops for one cycle
+    // between beats (half throughput). A deeper prefetch FIFO removes the
+    // bubble -- a good follow-up interview question.
     assign m_axi_wdata   = sp_rdata_buf;
-    assign m_axi_wlast   = (beat_cnt == cur_burst_beats - 8'd1) && (state == S_STORE_W);
+    assign m_axi_wlast   = (beat_cnt == burst_beats_reg - 8'd1) && (state == S_STORE_W);
     assign m_axi_wvalid  = (state == S_STORE_W) && sp_rdata_valid;
+    assign w_beat        = m_axi_wvalid && m_axi_wready;
 
     // B channel: always ready to accept response
     assign m_axi_bready  = (state == S_STORE_B);
@@ -366,14 +382,15 @@ module axi_dma_engine #(
     // -------------------------------------------------------------------------
 
     // Write to scratchpad on each received AXI read beat (LOAD direction)
-    assign sp_addr  = sp_addr_reg;
+    // On a W beat the next word is requested, so point at the next address
+    assign sp_addr  = w_beat ? sp_addr_reg + SP_ADDR_W'(BYTES_PER_BEAT) : sp_addr_reg;
     assign sp_wdata = m_axi_rdata;
     assign sp_wen   = (state == S_LOAD_R) && m_axi_rvalid && m_axi_rready;
 
-    // Read from scratchpad to feed AXI write bursts (STORE direction)
-    // Pre-read one cycle ahead of the W beat to meet timing
-    assign sp_ren   = (state == S_STORE_AR_READ) ||
-                      ((state == S_STORE_W) && m_axi_wvalid && m_axi_wready && !m_axi_wlast);
+    // Read from scratchpad to feed AXI write bursts (STORE direction):
+    // the first word of each burst at burst start, then the next word on
+    // every W beat except the last
+    assign sp_ren   = (state == S_STORE_AR_READ) || (w_beat && !m_axi_wlast);
 
     // -------------------------------------------------------------------------
     // Status
@@ -415,7 +432,7 @@ module axi_dma_engine #(
     // WLAST must be asserted on the last beat only
     assert property (@(posedge clk) disable iff (!rst_n)
         (m_axi_wvalid && m_axi_wlast) |->
-            (beat_cnt == cur_burst_beats - 8'd1))
+            (beat_cnt == burst_beats_reg - 8'd1))
         else $error("WLAST asserted on non-last beat");
 
     // synthesis translate_on
@@ -652,6 +669,8 @@ module tb_axi_dma_engine;
     // -------------------------------------------------------------------------
     // Test tasks
     // -------------------------------------------------------------------------
+    int total_errors = 0;
+
     task automatic do_load(
         input logic [AXI_ADDR_W-1:0] sys_a,
         input logic [SP_ADDR_W-1:0]  sp_a,
@@ -659,16 +678,18 @@ module tb_axi_dma_engine;
         input int                     bl,
         input string                  name
     );
+        int errors = 0;
+
         $display("=== LOAD test: %s (sys=0x%08x, sp=0x%05x, len=%0d, burst=%0d) ===",
                  name, sys_a, sp_a, nbytes, bl);
-        @(posedge clk);
+        @(negedge clk);        // drive away from the sampling edge
         cfg_sys_addr   = sys_a;
         cfg_sp_addr    = sp_a;
         cfg_byte_len   = nbytes;
         cfg_burst_len  = bl;
         cfg_direction  = 0;  // LOAD
         go = 1;
-        @(posedge clk);
+        @(negedge clk);
         go = 0;
 
         @(posedge done);
@@ -684,10 +705,13 @@ module tb_axi_dma_engine;
                 if (actual_byte !== expected_byte) begin
                     $error("LOAD data mismatch at byte %0d: expected 0x%02x got 0x%02x",
                            b + byte_i, expected_byte, actual_byte);
+                    errors++;
                 end
             end
         end
-        $display("  LOAD verification PASSED");
+        if (errors == 0) $display("  LOAD verification PASSED");
+        else             $display("  LOAD verification FAILED (%0d bytes wrong)", errors);
+        total_errors += errors;
     endtask
 
     task automatic do_store(
@@ -697,6 +721,8 @@ module tb_axi_dma_engine;
         input int                     bl,
         input string                  name
     );
+        int errors = 0;
+
         $display("=== STORE test: %s (sp=0x%05x, sys=0x%08x, len=%0d, burst=%0d) ===",
                  name, sp_a, sys_a, nbytes, bl);
 
@@ -704,14 +730,14 @@ module tb_axi_dma_engine;
         for (int i = 0; i < (nbytes + BYTES_BEAT - 1) / BYTES_BEAT; i++)
             scratchpad[(sp_a / BYTES_BEAT) + i] = 64'hDEAD_0000_0000_0000 | i;
 
-        @(posedge clk);
+        @(negedge clk);        // drive away from the sampling edge
         cfg_sys_addr   = sys_a;
         cfg_sp_addr    = sp_a;
         cfg_byte_len   = nbytes;
         cfg_burst_len  = bl;
         cfg_direction  = 1;  // STORE
         go = 1;
-        @(posedge clk);
+        @(negedge clk);
         go = 0;
 
         @(posedge done);
@@ -725,11 +751,15 @@ module tb_axi_dma_engine;
             logic [AXI_DATA_W-1:0] actual_word;
             for (int byte_i = 0; byte_i < BYTES_BEAT; byte_i++)
                 actual_word[(byte_i*8) +: 8] = sys_mem[sys_a + b + byte_i];
-            if (actual_word !== expected_word)
+            if (actual_word !== expected_word) begin
                 $error("STORE data mismatch at word %0d: expected 0x%016x got 0x%016x",
                        b/BYTES_BEAT, expected_word, actual_word);
+                errors++;
+            end
         end
-        $display("  STORE verification PASSED");
+        if (errors == 0) $display("  STORE verification PASSED");
+        else             $display("  STORE verification FAILED (%0d words wrong)", errors);
+        total_errors += errors;
     endtask
 
     // -------------------------------------------------------------------------
@@ -766,7 +796,8 @@ module tb_axi_dma_engine;
         // Test 6: STORE with large burst
         do_store(20'h0_0200, 32'h0000_2000, 128, 8'd8, "Store 128 bytes burst=8");
 
-        $display("ALL DMA TESTS PASSED");
+        if (total_errors == 0) $display("ALL DMA TESTS PASSED");
+        else                   $display("DMA TESTS FAILED: %0d mismatches", total_errors);
         $finish;
     end
 

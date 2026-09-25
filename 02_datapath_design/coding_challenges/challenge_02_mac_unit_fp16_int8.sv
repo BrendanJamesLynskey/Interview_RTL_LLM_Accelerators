@@ -505,6 +505,13 @@ endmodule : mac_unit_mixed_precision
 
 module tb_mac_unit_mixed_precision;
 
+    // Absolute value of a real. SystemVerilog has no $abs system function
+    // (it is a simulator extension), so define one for portability.
+    function automatic real abs_real(real x);
+        return (x < 0.0) ? -x : x;
+    endfunction
+
+
     // DUT signals
     logic        clk;
     logic        rst_n;
@@ -706,7 +713,7 @@ module tb_mac_unit_mixed_precision;
         test_result_real = fp32_to_real(test_result);
         expected_real = 1.0;
 
-        if ($abs(test_result_real - expected_real) < 0.01)
+        if (abs_real(test_result_real - expected_real) < 0.01)
             $display("PASS: FP16 acc = %f (expected 1.0)", test_result_real);
         else
             $display("FAIL: FP16 acc = %f (expected 1.0)", test_result_real);

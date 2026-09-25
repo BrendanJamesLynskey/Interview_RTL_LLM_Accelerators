@@ -13,9 +13,10 @@
 //      power of two (shown in the wrapper).
 //
 //   2. Pipelined: Pipeline registers are inserted between each level of the
-//      adder tree. A depth-log2(N) tree has log2(N) pipeline stages.
+//      adder tree. A depth-log2(N) tree has log2(N) adder stages, plus an
+//      input register stage.
 //      Throughput: one result per clock cycle once the pipeline is full.
-//      Latency: log2(N) clock cycles.
+//      Latency: log2(N) + 1 clock cycles.
 //
 //   3. Width-growing: Each adder level adds one bit to prevent overflow.
 //      After log2(N) levels, the output width is WIDTH + log2(N) bits.
@@ -49,7 +50,7 @@
 //   N=8, WIDTH=8:
 //   - Tree depth: log2(8) = 3 levels
 //   - Output width: 8 + 3 = 11 bits
-//   - Latency: 3 clock cycles
+//   - Latency: 3 adder levels + 1 input register = 4 clock cycles
 //   - Inputs (8x 8-bit): {10, 20, 30, 40, 50, 60, 70, 80}
 //   - Expected sum: 360 (fits in 11 bits: max 8 * 127 = 1016 < 2^10 = 1024)
 //
@@ -229,10 +230,14 @@ endmodule : accumulator_tree_wrap
 // Tests:
 //   Test 1 (N=8, WIDTH=8): Sum of {10,20,30,40,50,60,70,80} = 360
 //   Test 2 (N=8, WIDTH=8): Sum of {127,127,127,127,-128,-128,-128,-128} = -4
-//   Test 3 (N=8, WIDTH=8): Throughput test — consecutive valid inputs,
-//           verify output pipeline behaves as shift register (one result per cycle)
+//   Test 3 (N=8, WIDTH=8): All zeros
 //   Test 4 (N=4, WIDTH=16): Larger width test
 //   Test 5 (Non-pow2 wrapper, N=6, WIDTH=8): Sum of {1,2,3,4,5,6} = 21
+//   Test 6 (N=8, WIDTH=8): Throughput -- four back-to-back inputs must give
+//           four results on consecutive cycles (one result per clock)
+//
+// Latency: one input register plus log2(N) adder levels = log2(N) + 1 cycles.
+// Every check waits for valid_out and verifies both the sum and the latency.
 // =============================================================================
 
 module tb_accumulator_tree;
@@ -242,7 +247,7 @@ module tb_accumulator_tree;
     // ========================
     localparam int N8   = 8;
     localparam int W8   = 8;
-    localparam int D8   = $clog2(N8);    // 3 pipeline stages
+    localparam int D8   = $clog2(N8);    // 3 adder levels (latency D8 + 1)
     localparam int OW8  = W8 + D8;       // 11-bit output
 
     logic                      clk;
@@ -266,7 +271,7 @@ module tb_accumulator_tree;
     // ========================
     localparam int N4   = 4;
     localparam int W16  = 16;
-    localparam int D4   = $clog2(N4);    // 2 pipeline stages
+    localparam int D4   = $clog2(N4);    // 2 adder levels (latency D4 + 1)
     localparam int OW16 = W16 + D4;      // 18-bit output
 
     logic                       valid_in_4;
@@ -309,8 +314,44 @@ module tb_accumulator_tree;
     always #5 clk = ~clk;
 
     // -----------------------------------------------------------------------
-    // Task: drive one set of inputs and check output after DEPTH cycles
+    // Result checking
     // -----------------------------------------------------------------------
+    int fail_count = 0;
+
+    // Wait for valid_out (sampled just after each rising edge) and check the
+    // sum and the latency. Called after the edge that captured the input, so
+    // `latency` is the number of further edges (tree depth); the total
+    // latency reported is one more.
+    task automatic expect_result(input string name,
+                                 ref   logic  valid_out_s,
+                                 ref   logic signed [31:0] sum_s,
+                                 input longint expected,
+                                 input int     latency);
+        int cycles;
+        cycles = 0;
+        do begin
+            @(posedge clk); #1;
+            cycles++;
+        end while (!valid_out_s && cycles < 20);
+
+        if (!valid_out_s) begin
+            $display("FAIL (%s): valid_out never asserted", name);
+            fail_count++;
+        end else if (sum_s !== 32'(expected) || cycles != latency) begin
+            $display("FAIL (%s): sum = %0d, latency %0d cycles (expected %0d, latency %0d)",
+                     name, sum_s, cycles + 1, expected, latency + 1);
+            fail_count++;
+        end else begin
+            $display("PASS (%s): sum = %0d, latency %0d cycles", name, sum_s, cycles + 1);
+        end
+    endtask
+
+    // Sign-extended views of the three DUT outputs, for the shared checker
+    logic signed [31:0] sum_8_x, sum_4_x, sum_6_x;
+    assign sum_8_x = 32'(sum_out_8);
+    assign sum_4_x = 32'(sum_out_4);
+    assign sum_6_x = 32'(sum_out_6);
+
     task automatic check_sum_8(
         input logic signed [W8-1:0] vals [N8],
         input logic signed [OW8-1:0] expected
@@ -318,22 +359,10 @@ module tb_accumulator_tree;
         @(negedge clk);
         valid_in_8 = 1'b1;
         for (int i = 0; i < N8; i++) data_in_8[i] = vals[i];
-
         @(negedge clk);
         valid_in_8 = 1'b0;
-
-        // Wait D8 pipeline stages + 1 for registration
-        repeat (D8) @(posedge clk);
-
-        if (sum_out_8 === expected)
-            $display("PASS (N=8): sum = %0d (expected %0d)", sum_out_8, expected);
-        else
-            $display("FAIL (N=8): sum = %0d (expected %0d)", sum_out_8, expected);
-
-        if (!valid_out_8)
-            $display("FAIL (N=8): valid_out not asserted");
-        else
-            $display("PASS (N=8): valid_out asserted correctly");
+        // One input edge has passed; D8 more edges bring the sum out
+        expect_result("N=8", valid_out_8, sum_8_x, expected, D8);
     endtask
 
     task automatic check_sum_4(
@@ -343,38 +372,30 @@ module tb_accumulator_tree;
         @(negedge clk);
         valid_in_4 = 1'b1;
         for (int i = 0; i < N4; i++) data_in_4[i] = vals[i];
-
         @(negedge clk);
         valid_in_4 = 1'b0;
-
-        repeat (D4) @(posedge clk);
-
-        if (sum_out_4 === expected)
-            $display("PASS (N=4,W16): sum = %0d (expected %0d)", sum_out_4, expected);
-        else
-            $display("FAIL (N=4,W16): sum = %0d (expected %0d)", sum_out_4, expected);
+        expect_result("N=4,W16", valid_out_4, sum_4_x, expected, D4);
     endtask
 
     task automatic check_sum_6(
         input logic signed [W6-1:0] vals [N6],
         input logic signed [OW6-1:0] expected
     );
-        integer depth_6;
-        depth_6 = $clog2(1 << $clog2(N6)); // depth of padded tree = clog2(8) = 3
         @(negedge clk);
         valid_in_6 = 1'b1;
         for (int i = 0; i < N6; i++) data_in_6[i] = vals[i];
-
         @(negedge clk);
         valid_in_6 = 1'b0;
-
-        repeat (depth_6) @(posedge clk);
-
-        if (sum_out_6 === expected)
-            $display("PASS (N=6 wrap): sum = %0d (expected %0d)", sum_out_6, expected);
-        else
-            $display("FAIL (N=6 wrap): sum = %0d (expected %0d)", sum_out_6, expected);
+        // Padded to 8 inputs internally, so the tree depth is clog2(8) = 3
+        expect_result("N=6 wrap", valid_out_6, sum_6_x, expected, $clog2(N6));
     endtask
+
+    // Throughput monitor: record every valid N=8 output
+    int throughput_sums [$];
+    always @(posedge clk) begin
+        #1;
+        if (valid_out_8) throughput_sums.push_back(int'(sum_out_8));
+    end
 
     // -----------------------------------------------------------------------
     // Main test sequence
@@ -451,7 +472,8 @@ module tb_accumulator_tree;
         // Outputs appear at cycles D8=3 later: cycle 3,4,5,6
         // -----------------------------------------------
         $display("\n=== Test 6: Throughput — consecutive inputs ===");
-        @(negedge clk);
+        repeat (D8 + 2) @(negedge clk);   // let earlier results drain
+        throughput_sums.delete();
         valid_in_8 = 1'b1;
 
         // Drive 4 cycles of consecutive inputs
@@ -461,21 +483,23 @@ module tb_accumulator_tree;
         end
         valid_in_8 = 1'b0;
 
-        // Wait for first output (D8 cycles after first input)
-        // We already drove D8=3 valid cycles + 1 extra, so we need 0 more waits.
-        // Actually: first valid went at cycle T, output available at T + D8.
-        // We are at T + 4 now (4 negedge clk), so we need D8 - 4 + a few cycles.
-        // Let's just wait enough cycles and sample.
-        repeat (D8 + 2) @(posedge clk);
+        // Latency is D8 + 1 cycles, so all four results are out well within
+        // D8 + 4 further edges
+        repeat (D8 + 4) @(posedge clk);
+        #1;
+        if (throughput_sums.size() == 4 &&
+            throughput_sums[0] == 8  && throughput_sums[1] == 16 &&
+            throughput_sums[2] == 24 && throughput_sums[3] == 32)
+            $display("PASS (throughput): results 8, 16, 24, 32 on consecutive cycles");
+        else begin
+            $display("FAIL (throughput): got %p (expected '{8, 16, 24, 32})", throughput_sums);
+            fail_count++;
+        end
 
-        // At this point 4 outputs should have been valid in successive cycles.
-        // We check by monitoring valid_out and sum_out for 4 consecutive cycles.
-        // (In a real testbench, use @(posedge valid_out) to sample.)
-        $display("  Throughput test: checking that valid_out toggles at 1-cycle intervals.");
-        $display("  (Manual inspection of waveform recommended for this test.)");
-        $display("  Expected sums in order: 8, 16, 24, 32");
-
-        $display("\n=== All accumulator tree tests complete ===");
+        if (fail_count == 0)
+            $display("\n=== ALL ACCUMULATOR TREE TESTS PASSED ===");
+        else
+            $display("\n=== %0d ACCUMULATOR TREE TESTS FAILED ===", fail_count);
         $finish;
     end
 

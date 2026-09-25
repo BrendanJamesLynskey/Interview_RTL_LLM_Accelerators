@@ -403,6 +403,13 @@ endmodule
 // =============================================================================
 `ifdef SIMULATION
 module tb_rope_unit;
+
+    // Absolute value of a real. SystemVerilog has no $abs system function
+    // (it is a simulator extension), so define one for portability.
+    function automatic real abs_real(real x);
+        return (x < 0.0) ? -x : x;
+    endfunction
+
     // Parameters (small for simulation)
     localparam int HEAD_DIM     = 8;
     localparam int PAIR_ENGINES = 2;
@@ -583,7 +590,7 @@ module tb_rope_unit;
         max_err = 0.0;
         for (int i = 0; i < HEAD_DIM; i++) begin
             real diff;
-            diff = $abs(output_vec[i] - input_vec[i]);
+            diff = abs_real(output_vec[i] - input_vec[i]);
             if (diff > max_err) max_err = diff;
             $display("  [%0d] %.5f | %.5f | %.5f", i, input_vec[i], output_vec[i], diff);
         end
@@ -616,8 +623,8 @@ module tb_rope_unit;
 
         begin
             real err0, err1;
-            err0 = $abs(output_vec[0] - $cos(3.14159265/4.0));
-            err1 = $abs(output_vec[1] - $sin(3.14159265/4.0));
+            err0 = abs_real(output_vec[0] - $cos(3.14159265/4.0));
+            err1 = abs_real(output_vec[1] - $sin(3.14159265/4.0));
             $display("[TB] Errors: q'[0] err=%.6f, q'[1] err=%.6f", err0, err1);
             if (err0 < 0.005 && err1 < 0.005)
                 $display("[TB] PASS Test 2");
@@ -652,8 +659,8 @@ module tb_rope_unit;
 
         begin
             real err2, err3;
-            err2 = $abs(output_vec[2] - (-1.0 * input_vec[3]));
-            err3 = $abs(output_vec[3]);
+            err2 = abs_real(output_vec[2] - (-1.0 * input_vec[3]));
+            err3 = abs_real(output_vec[3]);
             if (err2 < 0.005 && err3 < 0.005)
                 $display("[TB] PASS Test 3");
             else

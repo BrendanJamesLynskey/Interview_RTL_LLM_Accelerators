@@ -53,21 +53,22 @@
 //
 // Verification
 // ------------
-// The included testbench sweeps all 65536 Q4.12 input codes and compares
-// against precomputed golden values, reporting max absolute error.
-// Expected max error: < 0.02 (5 LSB at Q4.12).
+// The included testbench sweeps every 16th Q4.12 input code (4096 codes over
+// the full range) and compares against the tanh-form GELU, reporting max
+// absolute error. With the fitted coefficients the max error over all codes
+// is about 20 LSB (~0.005); the testbench threshold is 0.02 (82 LSB).
 // =============================================================================
 
 // ---------------------------------------------------------------------------
 // PWL coefficient package
 // ---------------------------------------------------------------------------
 // Breakpoints (in Q4.12 integer representation, i.e., value * 4096):
-//   -4.0  -3.0  -2.0  -1.5  -1.0  -0.5  -0.25   0.0
-//    0.25   0.5   1.0   1.5   2.0   3.0   4.0
-// 16 segments between these 15 breakpoints (plus the >=4.0 identity region).
+//   -4.0  -3.0  -2.0  -1.5  -1.0  -0.75  -0.5  -0.25   0.0
+//    0.25   0.5   0.75   1.0   1.5   2.0   3.0   (4.0)
+// 16 segments, each [BP[i], BP[i+1]), plus the >= 4.0 identity region.
 //
-// Slopes and offsets were computed via least-squares fit of GELU over each
-// segment interval. Values are represented as Q4.12 signed integers.
+// Slopes and offsets are minimax fits of the tanh-form GELU over each
+// segment (see SLOPE below). Values are Q4.12 signed integers.
 // ---------------------------------------------------------------------------
 package gelu_coeff_pkg;
 
@@ -103,45 +104,48 @@ package gelu_coeff_pkg;
 
     // Slopes m[i] for each segment, in Q4.12.
     // GELU(x) ≈ m[i]*x + b[i] for x in [BP[i], BP[i+1]).
-    // These are approximate values; exact values depend on your offline fitting.
-    // Values given are representative for illustration.
+    // Fitted offline as integer Q4.12 pairs minimising the maximum error
+    // against the tanh-form GELU over every input code in the segment, using
+    // a bit-exact model of this datapath (rounded m*x, then + b).
+    // Note GELU is not monotonic: it dips to -0.17 near x = -0.75, so the
+    // slopes on [-4, -0.75) are negative, and it overshoots slope 1 above x = 0.75.
     localparam logic signed [15:0] SLOPE [0:NUM_SEGS-1] = '{
-        16'sh_0000,  // seg  0: [-4.0,-3.0)  slope ≈ 0.000  (near-zero tail)
-        16'sh_0041,  // seg  1: [-3.0,-2.0)  slope ≈ 0.010
-        16'sh_0118,  // seg  2: [-2.0,-1.5)  slope ≈ 0.069
-        16'sh_0241,  // seg  3: [-1.5,-1.0)  slope ≈ 0.141
-        16'sh_0410,  // seg  4: [-1.0,-0.75) slope ≈ 0.254
-        16'sh_059A,  // seg  5: [-0.75,-0.5) slope ≈ 0.350
-        16'sh_0750,  // seg  6: [-0.5,-0.25) slope ≈ 0.457
-        16'sh_0926,  // seg  7: [-0.25,0.0)  slope ≈ 0.572
-        16'sh_0AE1,  // seg  8: [0.0, 0.25)  slope ≈ 0.680
-        16'sh_0C79,  // seg  9: [0.25,0.5)   slope ≈ 0.780
-        16'sh_0DCA,  // seg 10: [0.5, 0.75)  slope ≈ 0.862
-        16'sh_0EBB,  // seg 11: [0.75,1.0)   slope ≈ 0.921
-        16'sh_0F4B,  // seg 12: [1.0, 1.5)   slope ≈ 0.955
-        16'sh_0FA6,  // seg 13: [1.5, 2.0)   slope ≈ 0.978
-        16'sh_0FE1,  // seg 14: [2.0, 3.0)   slope ≈ 0.992
-        16'sh_0FFC   // seg 15: [3.0, 4.0)   slope ≈ 0.999
+        16'sh_FFF0, // seg  0: [-4,-3)       slope  = -0.0039
+        16'sh_FF54, // seg  1: [-3,-2)       slope  = -0.0420
+        16'sh_FE3A, // seg  2: [-2,-1.5)     slope  = -0.1108
+        16'sh_FE19, // seg  3: [-1.5,-1)     slope  = -0.1189
+        16'sh_FF3E, // seg  4: [-1,-0.75)    slope  = -0.0474
+        16'sh_00FA, // seg  5: [-0.75,-0.5)  slope  = +0.0610
+        16'sh_0365, // seg  6: [-0.5,-0.25)  slope  = +0.2122
+        16'sh_0665, // seg  7: [-0.25,0)     slope  = +0.3997
+        16'sh_098B, // seg  8: [0,0.25)      slope  = +0.5964
+        16'sh_0C7E, // seg  9: [0.25,0.5)    slope  = +0.7808
+        16'sh_0EF6, // seg 10: [0.5,0.75)    slope  = +0.9351
+        16'sh_10B3, // seg 11: [0.75,1)      slope  = +1.0437
+        16'sh_11D8, // seg 12: [1,1.5)       slope  = +1.1152
+        16'sh_11C1, // seg 13: [1.5,2)       slope  = +1.1096
+        16'sh_10A9, // seg 14: [2,3)         slope  = +1.0413
+        16'sh_100E  // seg 15: [3,4)         slope  = +1.0034
     };
 
     // Offsets b[i] for each segment, in Q4.12.
     localparam logic signed [15:0] OFFSET [0:NUM_SEGS-1] = '{
-        16'sh_0000,  // seg  0: ≈ 0.000
-        16'sh_FF9B,  // seg  1: ≈ -0.025
-        16'sh_FF08,  // seg  2: ≈ -0.062
-        16'sh_FE95,  // seg  3: ≈ -0.105
-        16'sh_FF1A,  // seg  4: ≈ -0.057
-        16'sh_FFC0,  // seg  5: ≈ -0.016
-        16'sh_0030,  // seg  6: ≈ +0.012
-        16'sh_0071,  // seg  7: ≈ +0.028
-        16'sh_0071,  // seg  8: ≈ +0.028
-        16'sh_0030,  // seg  9: ≈ +0.012
-        16'sh_FFD0,  // seg 10: ≈ -0.012
-        16'sh_FF7A,  // seg 11: ≈ -0.033
-        16'sh_FF4E,  // seg 12: ≈ -0.047
-        16'sh_FFC5,  // seg 13: ≈ -0.013
-        16'sh_FFFC,  // seg 14: ≈ -0.001
-        16'sh_0001   // seg 15: ≈ +0.001
+        16'sh_FFC3, // seg  0: [-4,-3)       offset = -0.0149  (max err ~3 LSB)
+        16'sh_FE01, // seg  1: [-3,-2)       offset = -0.1248  (max err ~20 LSB)
+        16'sh_FBC0, // seg  2: [-2,-1.5)     offset = -0.2656  (max err ~6 LSB)
+        16'sh_FB88, // seg  3: [-1.5,-1)     offset = -0.2793  (max err ~7 LSB)
+        16'sh_FCB0, // seg  4: [-1,-0.75)    offset = -0.2070  (max err ~6 LSB)
+        16'sh_FDFC, // seg  5: [-0.75,-0.5)  offset = -0.1260  (max err ~9 LSB)
+        16'sh_FF32, // seg  6: [-0.5,-0.25)  offset = -0.0503  (max err ~12 LSB)
+        16'sh_FFF3, // seg  7: [-0.25,0)     offset = -0.0032  (max err ~13 LSB)
+        16'sh_FFF5, // seg  8: [0,0.25)      offset = -0.0027  (max err ~13 LSB)
+        16'sh_FF3D, // seg  9: [0.25,0.5)    offset = -0.0476  (max err ~12 LSB)
+        16'sh_FE06, // seg 10: [0.5,0.75)    offset = -0.1235  (max err ~9 LSB)
+        16'sh_FCBD, // seg 11: [0.75,1)      offset = -0.2039  (max err ~6 LSB)
+        16'sh_FB9A, // seg 12: [1,1.5)       offset = -0.2749  (max err ~7 LSB)
+        16'sh_FBC9, // seg 13: [1.5,2)       offset = -0.2634  (max err ~6 LSB)
+        16'sh_FE08, // seg 14: [2,3)         offset = -0.1230  (max err ~20 LSB)
+        16'sh_FFCA  // seg 15: [3,4)         offset = -0.0132  (max err ~3 LSB)
     };
 
 endpackage
@@ -397,6 +401,13 @@ endmodule
 
 module tb_gelu_approximation;
 
+    // Absolute value of an integer. SystemVerilog has no $abs system function
+    // (it is a simulator extension), so define one for portability.
+    function automatic integer abs_int(integer x);
+        return (x < 0) ? -x : x;
+    endfunction
+
+
     // -----------------------------------------------------------------------
     // DUT signals
     // -----------------------------------------------------------------------
@@ -536,7 +547,7 @@ module tb_gelu_approximation;
                 forever begin
                     @(posedge clk);
                     if (valid_o) begin
-                        abs_err = $abs($signed(y_out) - $signed(golden_pipe[PIPE_DEPTH-1]));
+                        abs_err = abs_int($signed(y_out) - $signed(golden_pipe[PIPE_DEPTH-1]));
                         if (abs_err > max_abs_error) begin
                             max_abs_error = abs_err;
                             worst_input   = golden_pipe[PIPE_DEPTH-1];  // approx
