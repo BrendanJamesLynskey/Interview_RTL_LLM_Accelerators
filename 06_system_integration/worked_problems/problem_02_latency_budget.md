@@ -25,7 +25,8 @@ latency components, and propose optimisations targeting the top-two contributors
 | PCIe Gen5 x16 | 63 GB/s, 1 µs one-way latency |
 
 **Note:** $B = 1$ represents the worst-case (minimum batch) latency scenario. This is the
-time-to-first-token (TTFT) decomposition for the very first decode step after prefill.
+time-per-output-token (TPOT) decomposition for one decode step after prefill (TTFT would also
+include the prefill itself).
 
 ---
 
@@ -122,8 +123,13 @@ Effective throughput (1 activation vector across 256-wide array): 256 MACs/cycle
 
 $$t_{GEMV\_QKV} = \frac{100.7 \times 10^6\ \text{FLOPs}}{256 \times 2\ \text{FLOPs/cycle} \times 1.5 \times 10^9\ \text{cycles/s}} \approx \frac{100.7\ \text{MFLOPs}}{768\ \text{GFLOPs/s}} \approx 131\ \mu\text{s}$$
 
-However, this is **memory-bandwidth-bound** (not compute-bound). The weight load (62.9 µs)
-and GEMV compute can be **pipelined** — load a tile of weights into SRAM, compute GEMV on that
+At 256 MACs/cycle the GEMV (131 µs) would be slower than the weight load (62.9 µs), so the
+datapath, not HBM, would set the pace. To keep up with HBM, the GEMV datapath must consume
+$1.6\ \text{TB/s} / 2\ \text{B} = 0.8 \times 10^{12}$ weights/s, i.e. at least
+$0.8 \times 10^{12} / 1.5 \times 10^9 \approx 534$ BF16 MACs/cycle. The budget below assumes the
+design feeds weights through more of the array than one 256-MAC row (well within the 20 TB/s SRAM
+feed), so that the step is **memory-bandwidth-bound**. The weight load (62.9 µs)
+and GEMV compute can then be **pipelined** — load a tile of weights into SRAM, compute GEMV on that
 tile, then load the next tile. The critical path is dominated by the weight load:
 
 $$t_{QKV,critical} = t_{QKV\_load} = 62.9\ \mu\text{s}$$
@@ -144,9 +150,9 @@ Negligible — 10 ns. Typically pipelined with other HBM traffic.
 
 Read $K_{0..l_{ctx}-1}$ and $V_{0..l_{ctx}-1}$ from HBM:
 
-$$\text{bytes}_{KV\_read} = 2 \times n_h \times d_k \times l_{ctx} \times 2\ \text{B} = 2 \times 32 \times 128 \times 1024 \times 2 = 16\ \text{MB}$$
+$$\text{bytes}_{KV\_read} = 2 \times n_h \times d_k \times l_{ctx} \times 2\ \text{B} = 2 \times 32 \times 128 \times 1024 \times 2 = 16,777,216\ \text{B} \approx 16.8\ \text{MB}$$
 
-$$t_{KV\_read} = \frac{16 \times 10^6\ \text{B}}{1.6 \times 10^{12}\ \text{B/s}} \approx 10\ \mu\text{s}$$
+$$t_{KV\_read} = \frac{16.8 \times 10^6\ \text{B}}{1.6 \times 10^{12}\ \text{B/s}} \approx 10.5\ \mu\text{s}$$
 
 This is the cost of reading the full KV history. It scales linearly with $l_{ctx}$.
 
@@ -159,7 +165,7 @@ FLOPs: $2 \times n_h \times d_k \times l_{ctx} = 2 \times 32 \times 128 \times 1
 The KV cache read and attention score computation are pipelined (fused attention): as each tile
 of K/V arrives from HBM, scores and weighted sums are computed immediately in SRAM.
 
-$$t_{attention,critical} = t_{KV\_read} = 10\ \mu\text{s}$$
+$$t_{attention,critical} = t_{KV\_read} = 10.5\ \mu\text{s}$$
 
 (The 8.4 MFLOPs of compute at 300 TOPS takes only 0.028 µs — completely overlapped.)
 
@@ -208,7 +214,7 @@ path through a single layer:
 | Operation | Latency (µs) | Pipelined with |
 |---|---|---|
 | QKV weight load + GEMV | 62.9 | Pipelined (load tiles while computing previous tile) |
-| KV cache read + attention | 10.0 | Pipelined (fused attention) |
+| KV cache read + attention | 10.5 | Pipelined (fused attention) |
 | Softmax | 0.007 | — |
 | Output projection load + GEMV | 21.0 | Pipelined |
 | Residual + LayerNorm | 0.001 | — |
@@ -225,7 +231,7 @@ Operations that cannot be pipelined with each other (strict data dependency):
 Serial critical path per layer:
 
 $$t_{layer} = t_{QKV} + t_{attn} + t_{O} + t_{FFN}$$
-$$= 62.9 + 10.0 + 21.0 + 169.1 = 263.0\ \mu\text{s/layer}$$
+$$= 62.9 + 10.5 + 21.0 + 169.1 = 263.5\ \mu\text{s/layer}$$
 
 ---
 
@@ -237,8 +243,8 @@ $$t_{decode} = t_{cmd} + t_{emb} + 32 \times t_{layer} + t_{lm\_head} + t_{sampl
 
 **lm_head (output projection, $d \rightarrow V$):**
 
-$$\text{bytes}_{lm\_head} = d \times V \times 2\ \text{B} = 4096 \times 32000 \times 2 = 256\ \text{MB}$$
-$$t_{lm\_head} = \frac{256 \times 10^6}{1.6 \times 10^{12}} = 160\ \mu\text{s}$$
+$$\text{bytes}_{lm\_head} = d \times V \times 2\ \text{B} = 4096 \times 32000 \times 2 = 262,144,000\ \text{B} \approx 262.1\ \text{MB}$$
+$$t_{lm\_head} = \frac{262.1 \times 10^6}{1.6 \times 10^{12}} = 163.8\ \mu\text{s}$$
 
 **Top-k sampling (from Problem Set on tokenizer hardware):** $\approx 21.7\ \mu\text{s}$
 
@@ -248,8 +254,8 @@ $$t_{result} \approx 1\ \mu\text{s}\ \text{(dominated by latency, not bandwidth)
 
 **Total decode latency:**
 
-$$t_{decode} = 1.0 + 0.1 + 32 \times 263.0 + 160.0 + 21.7 + 1.0$$
-$$= 1.0 + 0.1 + 8416.0 + 160.0 + 21.7 + 1.0 \approx 8599.8\ \mu\text{s} \approx 8.6\ \text{ms}$$
+$$t_{decode} = 1.0 + 0.1 + 32 \times 263.5 + 163.8 + 21.7 + 1.0$$
+$$= 1.0 + 0.1 + 8432.0 + 163.8 + 21.7 + 1.0 \approx 8619.6\ \mu\text{s} \approx 8.6\ \text{ms}$$
 
 **Tokens per second:** $1000 / 8.6 \approx 116\ \text{tokens/s}$ at batch 1.
 
@@ -260,17 +266,17 @@ $$= 1.0 + 0.1 + 8416.0 + 160.0 + 21.7 + 1.0 \approx 8599.8\ \mu\text{s} \approx 
 ```
 Component            Latency (µs)   Fraction
 ──────────────────────────────────────────────
-FFN weight load      32 × 169.1 = 5411   62.9%
+FFN weight load      32 × 169.1 = 5411   62.8%
 QKV weight load      32 ×  62.9 = 2013   23.4%
-Attention (KV read)  32 ×  10.0 =  320    3.7%
+Attention (KV read)  32 ×  10.5 =  336    3.9%
 Output proj. load    32 ×  21.0 =  672    7.8%
-lm_head                           160     1.9%
-Sampling + ctrl                    25     0.3%
+lm_head                           164     1.9%
+Sampling + ctrl                    24     0.3%
 ──────────────────────────────────────────────
-Total                             8601  100.0%
+Total                             8620  100.0%
 ```
 
-**Critical path is dominated by HBM weight loading (94.1% of total time).**
+**Critical path is dominated by HBM weight loading (93.9% of total time in the layers, 95.8% including lm_head).**
 
 ---
 
@@ -282,39 +288,40 @@ With INT4 weights (4-bit, packed 2 per byte), weight memory footprint is 4×  sm
 
 $$t_{FFN,int4} = 169.1 / 4 = 42.3\ \mu\text{s/layer}$$
 $$t_{QKV,int4} = 62.9 / 4 = 15.7\ \mu\text{s/layer}$$
-$$t_{O,int4} = 21.0 / 4 = 5.3\ \mu\text{s/layer}$$
+$$t_{O,int4} = 21.0 / 4 = 5.2\ \mu\text{s/layer}$$
 
-New per-layer critical path: $15.7 + 10.0 + 5.3 + 42.3 = 73.3\ \mu\text{s/layer}$
+New per-layer critical path: $15.7 + 10.5 + 5.2 + 42.3 = 73.7\ \mu\text{s/layer}$
 
-New total: $32 \times 73.3 + 160/4 + 25 + 2 = 2345.6 + 40 + 27 = 2412.6\ \mu\text{s}$
+New total: $32 \times 73.7 + 163.8/4 + 23.8 = 2358.4 + 41.0 + 23.8 = 2423.2\ \mu\text{s}$
 
-**Improvement: 8600 µs → 2413 µs, a 3.6× speedup** (approximately 4×, with the reduction
+**Improvement: 8620 µs → 2423 µs, a 3.6× speedup** (approximately 4×, with the reduction
 partially offset by the lm_head and other terms).
 
 Dequantisation overhead: INT4 → BF16 conversion per tile before the GEMV adder tree. At 1 FLOP
-per element for dequant, cost is $0.25 \times$ the MAC FLOPs — small relative to HBM load
+per element for dequant, cost is $0.5 \times$ the MAC FLOPs (each weight is used in one 2-FLOP MAC at $B = 1$) — small relative to HBM load
 savings.
 
-**Quality cost:** State-of-the-art INT4 methods (GPTQ, AWQ) achieve <1% perplexity degradation
-on LLaMA-2 7B — acceptable for most deployment scenarios.
+**Quality cost:** State-of-the-art INT4 methods (GPTQ, AWQ) raise LLaMA-2 7B WikiText-2 perplexity
+by about 2–4% (5.47 → 5.60 with AWQ, 5.69 with GPTQ, INT4 group size 128; AWQ paper, Table 4) —
+acceptable for most deployment scenarios.
 
 #### Optimisation B: KV Cache Compression to Reduce Attention Latency
 
-At $l_{ctx} = 1024$, attention accounts for $320 / 8600 = 3.7\%$ of latency — already modest.
+At $l_{ctx} = 1024$, attention accounts for $336 / 8620 = 3.9\%$ of latency — already modest.
 However, as context grows, the KV read latency grows linearly:
 
-At $l_{ctx} = 8192$: $t_{KV\_read} = 16\ \text{MB} \times 8 / 1.6\ \text{TB/s} = 80\ \mu\text{s/layer}$,
-contributing $32 \times 80 = 2560\ \mu\text{s}$ — more significant.
+At $l_{ctx} = 8192$: $t_{KV\_read} = 16.8\ \text{MB} \times 8 / 1.6\ \text{TB/s} = 83.9\ \mu\text{s/layer}$,
+contributing $32 \times 83.9 = 2684\ \mu\text{s}$ — more significant.
 
 **KV cache quantisation (INT8):** Halves KV read traffic. For $l_{ctx} = 8192$:
-$t_{KV\_read,int8} = 40\ \mu\text{s/layer}$, saving $32 \times 40 = 1280\ \mu\text{s}$.
+$t_{KV\_read,int8} = 41.9\ \mu\text{s/layer}$, saving $32 \times 41.9 = 1342\ \mu\text{s}$.
 
 **Multi-Query Attention (MQA):** Shares K and V across all heads (only 1 K, 1 V instead of 32):
-$$t_{KV\_read,MQA} = \frac{2 \times 1 \times 128 \times 1024 \times 2\ \text{B}}{1.6\ \text{TB/s}} = 0.31\ \mu\text{s/layer}$$
+$$t_{KV\_read,MQA} = \frac{2 \times 1 \times 128 \times 1024 \times 2\ \text{B}}{1.6\ \text{TB/s}} = 0.33\ \mu\text{s/layer}$$
 
-This is a 32× reduction in KV read latency. MQA is used in LLaMA-2 (specifically, Grouped Query
-Attention with 8 KV heads vs. 32 query heads — a 4× reduction), which is already accounted for in
-the 3.7% figure above.
+This is a 32× reduction in KV read latency. LLaMA-2 7B does not use MQA or GQA: it has 32 KV
+heads, as assumed above. Only the larger LLaMA-2 models (34B, 70B) use Grouped Query Attention,
+with 8 KV heads.
 
 ---
 
@@ -322,10 +329,10 @@ the 3.7% figure above.
 
 | Configuration | Total Latency | Tokens/s (B=1) |
 |---|---|---|
-| Baseline BF16 | 8,600 µs | 116 |
-| INT4 weights only | 2,413 µs | 414 |
-| INT4 weights + INT8 KV | 2,310 µs | 433 |
-| INT4 weights + MQA INT8 KV | ~2,250 µs | 444 |
+| Baseline BF16 | 8,620 µs | 116 |
+| INT4 weights only | 2,423 µs | 413 |
+| INT4 weights + INT8 KV | 2,256 µs | 443 |
+| INT4 weights + MQA INT8 KV | ~2,090 µs | 478 |
 
 **Key interview insight:** For single-sequence (B=1) decode latency, the bottleneck is
 **weight loading from HBM** (not compute). Weight quantisation is the single most impactful

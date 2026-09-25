@@ -67,7 +67,7 @@ $$= 141,557,760 \cdot B \cdot S \approx 1.416 \times 10^8 \cdot B \cdot S \ \tex
 
 **Weights** ($W_{\text{down}}$, loaded once per forward pass, BF16):
 
-$$\text{Bytes}_W = d_{ff} \times d \times 2 = 13824 \times 5120 \times 2 = 141,557,760 \approx 135.1\ \text{MB}$$
+$$\text{Bytes}_W = d_{ff} \times d \times 2 = 13824 \times 5120 \times 2 = 141,557,760 \approx 141.6\ \text{MB}\ (135.0\ \text{MiB})$$
 
 **Input activations** ($X$, loaded from previous layer output, BF16):
 
@@ -91,7 +91,7 @@ does not.
 
 $$\text{FLOPs} = 1.416 \times 10^8 \times 1 \times 2048 = 2.90 \times 10^{11}\ \text{FLOPs}$$
 
-$$\text{Bytes} = 141,557,760 + 37,888 \times 2048 = 141,557,760 + 77,594,624 = 219,152,384 \approx 209\ \text{MB}$$
+$$\text{Bytes} = 141,557,760 + 37,888 \times 2048 = 141,557,760 + 77,594,624 = 219,152,384 \approx 219.2\ \text{MB}$$
 
 $$I_{\text{prefill}} = \frac{2.90 \times 10^{11}}{2.19 \times 10^8} \approx \mathbf{1323\ \text{FLOP/Byte}}$$
 
@@ -103,7 +103,7 @@ $I_{\text{prefill}} = 1323 \gg I^* = 80$ $\Rightarrow$ **Compute-bound**.
 
 $$\text{FLOPs} = 1.416 \times 10^8 \times 1 \times 1 = 1.416 \times 10^8\ \text{FLOPs}$$
 
-$$\text{Bytes} = 141,557,760 + 37,888 \times 1 = 141,595,648 \approx 135.1\ \text{MB}$$
+$$\text{Bytes} = 141,557,760 + 37,888 \times 1 = 141,595,648 \approx 141.6\ \text{MB}$$
 
 The activation transfer is negligible ($37,888\ \text{B} = 37\ \text{KB}$) relative to weight transfer.
 
@@ -120,7 +120,7 @@ of weight bytes (in BF16), giving exactly 1 FLOP/Byte.
 
 $$\text{FLOPs} = 1.416 \times 10^8 \times 80 = 1.133 \times 10^{10}\ \text{FLOPs}$$
 
-$$\text{Bytes} = 141,557,760 + 37,888 \times 80 = 141,557,760 + 3,031,040 = 144,588,800 \approx 137.9\ \text{MB}$$
+$$\text{Bytes} = 141,557,760 + 37,888 \times 80 = 141,557,760 + 3,031,040 = 144,588,800 \approx 144.6\ \text{MB}$$
 
 $$I_{\text{decode, B80}} = \frac{1.133 \times 10^{10}}{1.446 \times 10^8} \approx \mathbf{78.4\ \text{FLOP/Byte}}$$
 
@@ -155,8 +155,10 @@ $$T_{\text{decode,B1}} = \frac{1.416 \times 10^8}{5 \times 10^{12}} = 2.83 \time
 Hardware utilisation: $5 / 400 = 1.25\%$ (severe underutilisation).
 
 **Sanity check**: Time to stream the weights at bandwidth $\beta$:
-$$T_{\text{stream}} = \frac{135.1 \text{ MB}}{5 \text{ TB/s}} = \frac{1.351 \times 10^8}{5 \times 10^{12}} = 27.0\ \mu\text{s}$$
-These match (the slight difference is activation I/O), confirming the memory-bound analysis.
+$$T_{\text{stream}} = \frac{141.6 \text{ MB}}{5 \text{ TB/s}} = \frac{1.416 \times 10^8}{5 \times 10^{12}} = 28.3\ \mu\text{s}$$
+These match, confirming the memory-bound analysis. (Activation I/O is only $37,888\ \text{B}$, about
+$0.03\%$ of the bytes moved. Take care with units here: $141,557,760\ \text{B}$ is $135.0\ \text{MiB}$
+but $141.6\ \text{MB}$; dividing the MiB figure by a decimal TB/s would wrongly give $27.0\ \mu\text{s}$.)
 
 ### (c) Decode $B=80$ ($I = 78.4$, near ridge point)
 
@@ -249,9 +251,9 @@ $$B_{\text{ridge}} \approx I^* = 80$$
 
 ## Part 6: Effect of INT4 Weight Quantisation
 
-**Changed quantity**: Weight bytes halved again (INT4 = 0.5 bytes/param):
+**Changed quantity**: Weight bytes quartered (INT4 = 0.5 bytes/param vs 2 for BF16):
 
-$$\text{Bytes}_W^{\text{INT4}} = 13824 \times 5120 \times 0.5 = 35,389,440 \approx 33.8\ \text{MB}$$
+$$\text{Bytes}_W^{\text{INT4}} = 13824 \times 5120 \times 0.5 = 35,389,440 \approx 35.4\ \text{MB}$$
 
 **New ridge point**: The accelerator's $\Pi$ stays the same (compute throughput is unchanged),
 but if we assume the INT4 dequantisation can match MAC throughput (reasonable for modern
@@ -286,7 +288,7 @@ $\approx 20$, making it much easier to achieve high hardware utilisation at lowe
 
 | Metric | BF16 | INT4 | Change |
 |---|---|---|---|
-| Weight bytes (this layer) | 135.1 MB | 33.8 MB | $-4\times$ |
+| Weight bytes (this layer) | 141.6 MB | 35.4 MB | $-4\times$ |
 | Decode $B=1$ intensity | 1 FLOP/B | 4 FLOP/B | $+4\times$ |
 | Decode $B=1$ TFLOP/s | 5 | 20 | $+4\times$ |
 | Decode $B=1$ latency | 28.3 $\mu$s | 7.1 $\mu$s | $-4\times$ |

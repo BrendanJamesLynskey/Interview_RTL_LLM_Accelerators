@@ -299,8 +299,8 @@ This allows single-pass processing without storing all logits.
 
 ### Q3 — Correct: B
 
-The decomposition `exp(x) = exp(n * ln2 + f) = 2^n * exp(f)` where n = floor(x / ln2) and f is
-the remainder (|f| < ln2 / 2) allows: (1) the integer part 2^n is an exact shift operation, and
+The decomposition `exp(x) = exp(n * ln2 + f) = 2^n * exp(f)` where n = round(x / ln2) and f is
+the remainder (|f| <= ln2 / 2) allows: (1) the integer part 2^n is an exact shift operation, and
 (2) exp(f) over a small bounded range is well-approximated by a small polynomial or LUT. This is
 the basis of libm implementations and hardware exp units.
 
@@ -342,16 +342,16 @@ that occurs in systems requiring contiguous KV cache buffers of variable lengths
 ### Q6 — Correct: B
 
 Per layer, per request: 2 (K and V) * 64 heads * 128 head_dim * 4096 tokens * 2 bytes/FP16
-= 2 * 64 * 128 * 4096 * 2 = 134,217,728 bytes = 128 MB per layer.
+= 2 * 64 * 128 * 4096 * 2 = 134,217,728 bytes = 128 MiB per layer.
 
-Total for 80 layers: 80 * 128 MB = 10,240 MB ≈ **10 GB**.
+Total for 80 layers: 80 * 128 MiB = 10,240 MiB = 10 GiB (10.7 GB) ≈ **10 GB**.
 
 - A incorrect: 5 GB would correspond to half the sequence length (2048) or half the head dimension,
   neither of which matches the given parameters.
-- C incorrect: 20 GB would correspond to double the correct calculation — e.g., if BF32 (4 bytes)
+- C incorrect: 20 GB would correspond to double the correct calculation — e.g., if FP32 (4 bytes)
   was assumed instead of FP16 (2 bytes).
-- D incorrect: 40 GB would require 4 bytes per element (FP32) and full 4096 sequence, which does
-  not match the given FP16 precision.
+- D incorrect: 40 GB is 4x the correct value; it would require both 4 bytes per element (FP32)
+  and twice the 4096-token sequence, which does not match the given parameters.
 
 ### Q7 — Correct: B
 
@@ -438,8 +438,9 @@ KV block. The KV cache bandwidth is reduced by the factor H/G compared to standa
 
 Standard attention writes the N x N score matrix to HBM after computing QK^T, reads it back for
 softmax, then reads it again to compute the weighted sum with V. For N=8192, the score matrix is
-8192^2 * 2 bytes = 128 GB — far exceeding HBM capacity for a single sequence. FlashAttention
-avoids materialising this matrix in HBM entirely.
+8192^2 * 2 bytes = 128 MiB per head per layer — gigabytes of HBM traffic once multiplied across
+heads, and written and read more than once. FlashAttention avoids materialising this matrix in
+HBM entirely.
 
 - A incorrect: Q, K, V projection weights are part of the model and are loaded once per decode
   step regardless; FlashAttention does not address this.

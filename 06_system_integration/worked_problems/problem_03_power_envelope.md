@@ -69,7 +69,7 @@ This seems low — let us cross-check. Published values for Google TPU v4 (7nm) 
 the 275 TOPS BF16 array; NVIDIA A100 (7nm SXM) is ~400 W total for 312 TOPS. At 5nm, efficiency
 improves ~40% over 7nm:
 
-Revised estimate: $0.25 \times (7\text{nm}/5\text{nm})^2 \approx 0.25 \times 0.51 = 0.13$ pJ/MAC
+Revised estimate: $0.25 \times (5\text{nm}/7\text{nm})^2 \approx 0.25 \times 0.51 = 0.13$ pJ/MAC
 at 5nm... but this contradicts our stated constant. Let us use the stated value and note that real
 published data for 5nm AI chips (Apple M2 Neural Engine, Amazon Inferentia2) suggest MAC array
 power of ~0.1–0.3 pJ/MAC inclusive of local register file and interconnect.
@@ -165,12 +165,14 @@ $$L_{tree} \approx 4 \sqrt{450}\ \text{mm} \times \log_2(N_{sink})\ \text{levels
 
 $$C_{total} = 15 \times 10^{-15}\ \text{F/}\mu\text{m} \times 1018 \times 10^3\ \mu\text{m} = 15.3\ \text{nF}$$
 
-$$P_{clock} = 0.5 \times C_{total} \times V_{DD}^2 \times f = 0.5 \times 15.3 \times 10^{-9} \times 0.85^2 \times 1.8 \times 10^9$$
-$$= 0.5 \times 15.3 \times 0.7225 \times 1.8 = 9.98\ \text{W} \approx 10\ \text{W}$$
+The clock net makes one full charge–discharge cycle every clock period, so its activity factor
+is $\alpha_{clock} = 1$:
+
+$$P_{clock} = 1 \times C_{total} \times V_{DD}^2 \times f = 15.3 \times 10^{-9} \times 0.85^2 \times 1.8 \times 10^9$$
+$$= 15.3 \times 0.7225 \times 1.8 = 19.9\ \text{W}$$
 
 **Cross-check:** Published AI chips at 7nm typically report 8–15% of total chip power for clock
-distribution. Our 10 W on ~200 W total ≈ 5% — slightly low, consistent with 5nm's better clock
-buffer efficiency.
+distribution. Our 19.9 W on ~200 W total ≈ 10% — within that range.
 
 ---
 
@@ -181,11 +183,13 @@ buffer efficiency.
 **NoC and on-chip interconnect:** Estimated from wire switching activity. For a mesh NoC with
 typical 10–15% link utilisation during compute:
 
-$$P_{NoC} \approx 0.1\ \text{pJ/bit} \times 256\ \text{bits/link} \times 8\ \text{links} \times 1.8 \times 10^9 \times 0.15 = 5.5\ \text{W}$$
+$$P_{NoC} \approx 0.1\ \text{pJ/bit} \times 256\ \text{bits/link} \times 8\ \text{links} \times 1.8 \times 10^9 \times 0.15 = 0.055\ \text{W}$$
+
+(With only 8 links this is negligible; a large mesh with many more links would draw proportionally more.)
 
 **Control CPU + misc logic (ARM Cortex-M55 equivalent):** 0.5 W.
 
-**Total I/O and misc:** $P_{IO} = 7 + 5.5 + 0.5 = 13\ \text{W}$
+**Total I/O and misc:** $P_{IO} = 7 + 0.055 + 0.5 \approx 7.6\ \text{W}$
 
 ---
 
@@ -199,11 +203,11 @@ $$P_{NoC} \approx 0.1\ \text{pJ/bit} \times 256\ \text{bits/link} \times 8\ \tex
 | SRAM dynamic | 18.9 | Full access rate |
 | SRAM leakage | 10.75 | Always on |
 | HBM (2 stacks, full rate) | 24.0 | Near-peak BW |
-| Clock distribution | 10.0 | Fixed |
-| PCIe + NoC + control | 13.0 | Fixed |
-| **Total (prefill)** | **106.2** | |
+| Clock distribution | 19.9 | Fixed |
+| PCIe + NoC + control | 7.6 | Fixed |
+| **Total (prefill)** | **110.7** | |
 
-**Result: 106 W during prefill — well within 300 W TDP.**
+**Result: 111 W during prefill — well within 300 W TDP.**
 
 This figure is suspiciously low compared to real AI accelerators. The discrepancy comes from the
 MAC array energy constant — real systolic arrays have higher power due to datapath registers,
@@ -221,11 +225,11 @@ $$P_{MAC,system} = 29.5 \times 4 = 118\ \text{W}$$
 | SRAM dynamic | 18.9 |
 | SRAM leakage | 10.75 |
 | HBM | 24.0 |
-| Clock | 10.0 |
-| I/O + misc | 13.0 |
-| **Total (prefill)** | **194.7 W** |
+| Clock | 19.9 |
+| I/O + misc | 7.6 |
+| **Total (prefill)** | **199.2 W** |
 
-**Margin to 300 W TDP:** $300 - 194.7 = 105.3\ \text{W}$ headroom.
+**Margin to 300 W TDP:** $300 - 199.2 = 100.8\ \text{W}$ headroom.
 
 #### Decode Phase (MAC underutilised, HBM bandwidth-bound)
 
@@ -248,11 +252,11 @@ $$P_{SRAM,dyn,decode} = 18.9 \times 0.13 \approx 2.5\ \text{W}$$
 | SRAM dynamic | 18.9 | 2.5 |
 | SRAM leakage | 10.75 | 10.75 |
 | HBM (full BW decode) | 24.0 | 22.0 |
-| Clock | 10.0 | 7.0 (DVFS: 1.2 GHz) |
-| I/O + misc | 13.0 | 10.0 |
-| **Total** | **194.7 W** | **67.6 W** |
+| Clock | 19.9 | 13.3 (DVFS: 1.2 GHz) |
+| I/O + misc | 7.6 | 7.6 |
+| **Total** | **199.2 W** | **71.5 W** |
 
-**Decode power is ~35% of prefill power.** The TDP is hit during prefill; decode has large
+**Decode power is ~36% of prefill power.** Peak power occurs during prefill; decode has large
 thermal headroom that can be used for higher batch sizes.
 
 ---
@@ -265,29 +269,31 @@ prefill, what TOPS do we achieve?
 **Power budget for MAC array (after fixed overheads):**
 
 $$P_{MAC,budget} = 300 - P_{SRAM} - P_{HBM} - P_{clock} - P_{IO}$$
-$$= 300 - (18.9 + 10.75) - 24 - 10 - 13 = 300 - 76.65 = 223.35\ \text{W}$$
+$$= 300 - (18.9 + 10.75) - 24 - 19.9 - 7.6 = 300 - 81.15 = 218.85\ \text{W}$$
 
 **Solving for TOPS:**
 
-$$P_{MAC} = E_{MAC,system} \times \text{TOPS} \times 10^{12}$$
+$$P_{MAC} = E_{MAC,system} \times \text{MACs/s}, \qquad \text{TOPS} = 2 \times \text{MACs/s} / 10^{12}$$
 
 where $E_{MAC,system} = 4 \times E_{MAC} = 4 \times 0.25 = 1\ \text{pJ/MAC}$ (with PE overhead).
 
-$$\text{TOPS} = \frac{P_{MAC,budget}}{E_{MAC,system} \times 10^{12}} = \frac{223.35}{1 \times 10^{-12} \times 10^{12}} = \frac{223.35}{1} = 223.35\ \text{TOPS}$$
+$$\text{MACs/s} = \frac{P_{MAC,budget}}{E_{MAC,system}} = \frac{218.85}{1 \times 10^{-12}} = 2.19 \times 10^{14}\ \text{MACs/s} \Rightarrow 437.7\ \text{TOPS}$$
 
-**Maximum BF16 TOPS within 300 W TDP: approximately 224 TOPS.**
+**Maximum BF16 TOPS within 300 W TDP: approximately 438 TOPS.** The specified 256 × 256 array
+(236 TOPS, 118 W with PE overhead) is well below this ceiling, so the TDP does not limit it; the
+array could be scaled up by about 1.85× before the TDP binds.
 
 **Implications for prefill throughput:**
 
-At 224 TOPS (assuming 70% MAC utilisation during prefill):
+At 438 TOPS (assuming 70% MAC utilisation during prefill):
 
-$$\text{Effective TOPS} = 0.70 \times 224 = 156.8\ \text{TOPS}$$
+$$\text{Effective TOPS} = 0.70 \times 437.7 = 306.4\ \text{TOPS}$$
 
-Prefill latency for LLaMA-2 7B ($B=16$, $S=512$, 107.4 TFLOPs):
+Prefill latency for LLaMA-2 7B ($B=16$, $S=512$, 107.3 TFLOPs):
 
-$$t_{prefill} = \frac{107.4\ \text{TFLOPs}}{156.8\ \text{TOPS}} \approx 685\ \text{ms}$$
+$$t_{prefill} = \frac{107.3\ \text{TFLOPs}}{306.4\ \text{TOPS}} \approx 350\ \text{ms}$$
 
-Tokens per second (prefill): $\frac{8192\ \text{tokens}}{685\ \text{ms}} \approx 11,960\ \text{tokens/s}$
+Tokens per second (prefill): $\frac{8192\ \text{tokens}}{350\ \text{ms}} \approx 23,400\ \text{tokens/s}$
 
 ---
 
@@ -301,8 +307,10 @@ Power scales as $V^2 \times f$:
 
 $$\frac{P_{decode}}{P_{prefill}} = \left(\frac{0.72}{0.85}\right)^2 \times \frac{1.2}{1.8} = 0.716 \times 0.667 = 0.478$$
 
-At decode utilisation: total decode power further reduced by MAC underutilisation.
-Net decode power at DVFS: $67.6 \times (0.72/0.85)^2 \times (1.2/1.8) \approx 32\ \text{W}$.
+This ratio applies only to core dynamic power. The decode table above already runs the clock at
+1.2 GHz, and the MAC and SRAM work rate is fixed by HBM bandwidth, so the remaining saving is the
+$V^2$ factor ($0.72$) on the MAC, SRAM-dynamic and clock terms; leakage, HBM and I/O do not scale.
+Net decode power at DVFS: $(15.3 + 2.5 + 13.3) \times 0.72 + 10.75 + 22 + 7.6 \approx 63\ \text{W}$.
 
 This leaves even more thermal headroom, enabling aggressive batch size increases to maximise
 decode throughput.
@@ -318,14 +326,16 @@ Saving ~8 W of leakage during decode by power-gating unused SRAM.
 
 #### Strategy C: INT8 Quantisation for Higher TOPS/W
 
-INT8 MACs use a 4× smaller multiplier than BF16 (8×8 vs. 16×16 mantissa bits). Energy per
-INT8 MAC at 5nm is approximately $0.25 \times (8/11)^2 \approx 0.13$ pJ/MAC.
+INT8 MACs are cheaper than BF16 MACs. Scaling the multiplier energy by significand width squared
+gives $0.25 \times (8/11)^2 \approx 0.13$ pJ/MAC. (The 11 is FP16's significand width; BF16's
+significand is only 8 bits, so this is an optimistic estimate for BF16 → INT8.) Applying the same
+4× PE overhead gives $E_{INT8,system} \approx 0.53$ pJ/MAC.
 
 At the same 300 W TDP, INT8 array delivers:
 
-$$\text{TOPS}_{INT8} = \frac{P_{MAC,budget}}{E_{INT8} \times 10^{12}} = \frac{223.35}{0.13} \approx 1720\ \text{TOPS (INT8)}$$
+$$\text{TOPS}_{INT8} = \frac{2 \times P_{MAC,budget}}{E_{INT8,system} \times 10^{12}} = \frac{2 \times 218.85}{0.53} \approx 826\ \text{TOPS (INT8)}$$
 
-The INT8 array is $1720 / 224 \approx 7.7\times$ more power-efficient per TOPS — the reason all
+The INT8 array is $826 / 438 \approx 1.9\times$ more power-efficient per TOPS — the reason all
 production AI accelerators support INT8 as a primary inference format.
 
 ---
@@ -334,11 +344,11 @@ production AI accelerators support INT8 as a primary inference format.
 
 | Phase | TDP (W) | MAC Util | Effective TOPS | Bottleneck |
 |---|---|---|---|---|
-| Prefill (BF16) | 195 W | ~70% | ~156 TOPS | Compute |
-| Decode (BF16) | 68 W | ~13% | ~29 TOPS | HBM bandwidth |
-| Decode (DVFS) | ~32 W | ~13% | ~29 TOPS | HBM bandwidth |
+| Prefill (BF16) | 199 W | ~70% | ~165 TOPS | Compute |
+| Decode (BF16) | 72 W | ~13% | ~31 TOPS | HBM bandwidth |
+| Decode (DVFS) | ~63 W | ~13% | ~31 TOPS | HBM bandwidth |
 
-**Maximum TOPS within 300 W TDP: 224 TOPS (BF16), 1720 TOPS (INT8).**
+**Maximum TOPS within 300 W TDP: 438 TOPS (BF16), 826 TOPS (INT8).**
 
 **Key interview takeaways:**
 
@@ -346,7 +356,8 @@ production AI accelerators support INT8 as a primary inference format.
    raw multiplier energy by 3–5×; never estimate power from the multiplier alone.
 2. HBM PHY draws significant fixed power (~24 W) even when utilisation is low — power gating HBM
    stacks selectively is non-trivial due to PHY link training time on wakeup.
-3. Decode phase operates at ~35% of prefill TDP, creating thermal headroom that can be used
+3. Decode phase operates at ~36% of prefill power, creating thermal headroom that can be used
    for larger batch sizes (more sequences in flight) to improve total throughput.
-4. DVFS between phases is a significant power optimisation: decode can run at ~0.7× voltage and
-   0.67× frequency, saving ~52% of the already-lower decode power.
+4. DVFS between phases helps, but less than $V^2 f$ suggests: decode can run at ~0.85× voltage and
+   0.67× frequency, yet leakage, HBM and I/O power don't scale, so the voltage step saves only
+   ~12% of the already-lower decode power.

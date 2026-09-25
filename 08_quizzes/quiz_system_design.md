@@ -67,7 +67,7 @@ throughput is expressed as TOPS (Tera Operations Per Second). What is the peak T
 ## Section 2 — PCIe Interface (Questions 5-7)
 
 **Q5.** A discrete LLM accelerator connects to a host server over PCIe Gen 5 x16. The peak
-unidirectional bandwidth of PCIe Gen 5 x16 is approximately 128 GB/s. For LLM inference with
+unidirectional bandwidth of PCIe Gen 5 x16 is approximately 64 GB/s. For LLM inference with
 batch size 1, the host must send a prompt of 1024 tokens (each 4 bytes = 4 KB of token IDs) and
 receive 512 output tokens. How does PCIe bandwidth compare to HBM bandwidth for this workload?
 
@@ -76,14 +76,14 @@ receive 512 output tokens. How does PCIe bandwidth compare to HBM bandwidth for 
 - B) PCIe is not the bottleneck: the data transferred over PCIe (prompt + output tokens, ~6 KB
    total) is negligible compared to the weight streaming bandwidth requirement (~hundreds of GB/s
    from HBM), so HBM bandwidth dominates
-- C) PCIe and HBM have equal bandwidth contributions because PCIe supplies activations at 128 GB/s
+- C) PCIe and HBM have equal bandwidth contributions because PCIe supplies activations at 64 GB/s
    while HBM supplies weights at 3.35 TB/s
 - D) PCIe becomes the bottleneck only when batch size exceeds 1024, because larger batches require
    more activation data to be transferred
 
 ---
 
-**Q6.** In PCIe, DMA from the accelerator to host memory is called DMA Read (from accelerator
+**Q6.** In PCIe, DMA from host memory to the accelerator is called DMA Read (from accelerator
 perspective). The accelerator initiates a Memory Read TLP (Transaction Layer Packet). What limits
 the achievable bandwidth for small transfers (e.g., 64-byte completion tokens)?
 
@@ -294,7 +294,7 @@ the model size is 7 GB, what minimum HBM bandwidth B is required?
 | 13 | B      |
 | 14 | B      |
 | 15 | C      |
-| 16 | C      |
+| 16 | B      |
 | 17 | B      |
 | 18 | B      |
 | 19 | B      |
@@ -369,7 +369,7 @@ units at 1 GHz: Peak TOPS = 1024 MACs * 2 ops/MAC * 1 x 10^9 cycles/s = 2.048 x 
 ### Q5 — Correct: B
 
 The prompt (1024 tokens x 4 bytes) = 4 KB. The output (512 token IDs x 4 bytes) = 2 KB. Total
-PCIe traffic ≈ 6 KB. At 128 GB/s, this takes 6 KB / 128 GB/s ≈ 47 nanoseconds — negligible.
+PCIe traffic ≈ 6 KB. At 64 GB/s, this takes 6 KB / 64 GB/s ≈ 94 nanoseconds — negligible.
 Meanwhile, loading a 7B INT8 model from HBM at 3.35 TB/s (H100) takes 7 GB / 3.35 TB/s ≈ 2 ms
 just for one token's weight pass. PCIe is clearly not the bottleneck.
 
@@ -379,9 +379,9 @@ just for one token's weight pass. PCIe is clearly not the bottleneck.
 - C incorrect: The statement about PCIe and HBM having "equal bandwidth contributions" is false.
   They carry fundamentally different data (token IDs vs. weights) and their relative contributions
   to latency differ by orders of magnitude.
-- D incorrect: Even at batch size 1024, prompt activation data (1024 prompts x 1024 tokens x 2
-  bytes embedding = 2 GB) would take 2 GB / 128 GB/s = 15.6 ms — still far smaller than the
-  weight loading time. PCIe is unlikely to become the dominant bottleneck for inference workloads.
+- D incorrect: Even at batch size 1024, the prompt token IDs (1024 prompts x 1024 tokens x 4
+  bytes = 4 MB) would take 4 MB / 64 GB/s ≈ 66 µs — still far smaller than the weight loading
+  time. PCIe is unlikely to become the dominant bottleneck for inference workloads.
 
 ### Q6 — Correct: B
 
@@ -419,7 +419,7 @@ participate in the CPU's cache coherence domain. For LLM inference, this could a
 Each transformer layer involves loading and processing the weights for the attention QKV
 projections, output projection, and FFN (two large matrices). For a 32-layer model, this means
 loading and computing through 32 sets of large weight matrices. Even for a 7B model with efficient
-hardware, this takes tens of milliseconds per token in the memory-bandwidth-bound regime.
+hardware, this takes milliseconds to tens of milliseconds per token in the memory-bandwidth-bound regime.
 Tokenisation, embedding, logit projection, and sampling together take microseconds to
 low-milliseconds and are negligible by comparison.
 
@@ -460,9 +460,9 @@ d_ff/T-element fragment, and all chips end up with the full d_ff-element vector.
   computes a partial sum that must be accumulated (e.g., row-parallel GEMM where each chip
   computes a partial dot product). For column-parallel, partial results are non-overlapping and
   must be concatenated, not summed.
-- C incorrect: Reduce-Scatter is the combination of All-Reduce and Scatter, used in distributed
-  training gradient synchronisation. It is not the appropriate collective for tensor parallelism
-  forward pass output reconstruction.
+- C incorrect: Reduce-Scatter sums partial results and leaves each chip with one shard of the
+  sum. It applies when partial sums must be reduced (row-parallel layers), not when the
+  column-parallel outputs are disjoint and only need concatenating.
 - D incorrect: Ring point-to-point passes results sequentially, which is equivalent to a ring
   All-Reduce or a ring All-Gather. While a ring topology implements All-Gather, the term
   "point-to-point send" as described (chip N accumulates and passes to chip N+1) describes an
@@ -481,7 +481,7 @@ The question states C = 50 pF. Applying the formula directly: P = 0.2 * 50e-12 *
 
 - B incorrect: 6.4 W corresponds to C = 50 nF (nanofarads, 1000x larger than stated).
 - C incorrect: 64 mW corresponds to C = 500 pF, which is 10x larger than stated.
-- D incorrect: 64 W requires C = 5 uF, which is wildly unrealistic for a MAC array gate capacitance.
+- D incorrect: 64 W requires C = 500 nF, which is wildly unrealistic for a MAC array gate capacitance.
 
 The key formula insight: double-check units. P = 0.2 * 50e-12 * 0.64 * 1e9 = 6.4e-3 W = 6.4 mW.
 
@@ -544,28 +544,16 @@ explicitly tracks.
 - D incorrect: Branch coverage verifies both outcomes of every conditional, which is important
   but does not explicitly track multi-dimensional parameter space coverage.
 
-### Q16 — Correct: C
+### Q16 — Correct: B
 
-Per-token compute: 32 layers * 1M MACs/layer = 32M MACs = 32M operations (counting MACs as
-one operation each) or 64M single ops. For a 256-wide MAC array at 1 GHz:
-Throughput = 256 MACs/cycle * 1e9 cycles/s = 256e6 MACs/s = 256 MMAC/s.
-Time = 32M MACs / 256M MACs/s = 32/256 seconds = 0.125 s — that is far too high.
+Per-token compute: 32 layers * 1M MACs/layer = 32M MACs. A 256-wide MAC array at 1 GHz performs
+256 MACs/cycle = 256e9 MACs/s.
 
-Re-examining: 32M MACs / (256 MACs/cycle) = 125,000 cycles = 125 microseconds at 1 GHz.
-
-So 125 microseconds — option B.
-
-Wait, let's recheck option C: 3.9 microseconds. That would require: 32M / 3.9e-6 s = 8.2e12
-MACs/s, which is way higher than 256M MACs/s. So option C is wrong.
-
-**Correction: Q16 = B (125 microseconds).**
-
-Verification: 32M MACs / (256 MACs/cycle * 1e9 cycles/s) = 32e6 / 256e6 s = 0.125e-0 s =
-125e-6 s = 125 microseconds.
+Time = 32M MACs / (256 MACs/cycle) = 125,000 cycles = **125 microseconds** at 1 GHz — option B.
 
 - A incorrect: 32 microseconds would require the array to process 32M MACs / 32e-6 s = 1e12
   MACs/s, requiring 1000 MAC units at 1 GHz — not 256.
-- C incorrect: 3.9 microseconds is approximately 32M / 8192 MAC array — the 256-array is ~33x
+- C incorrect: 3.9 microseconds is approximately 32M / 8192 MAC array — the 256-array is 32x
   slower than required for this answer.
 - D incorrect: 1 millisecond would imply only 32M / 1e-3 = 32e9 MACs/s, requiring 32 MAC units
   at 1 GHz (not 256). The calculation is 8x off.
@@ -630,8 +618,8 @@ bandwidth saturation.
 At 1000 tokens/s with each token requiring one pass over all model weights (7 GB INT8):
 Required bandwidth = 7 GB/token * 1000 tokens/s = **7000 GB/s = 7 TB/s**.
 
-This is a strikingly high number — far beyond what current HBM3e (4.8 TB/s per device) achieves
-on a single chip. In practice, achieving 1000 tokens/s for a 7B model requires either batching
+This is a strikingly high number — beyond what most current HBM3e accelerators achieve on a
+single chip (e.g. 4.8 TB/s on an H200). In practice, achieving 1000 tokens/s for a 7B model requires either batching
 (amortising weights over many requests) or multi-chip systems with combined HBM bandwidth.
 
 - A incorrect: 7 GB/s is the bandwidth requirement for 1 token/s, not 1000 tokens/s. This is 3

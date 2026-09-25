@@ -64,10 +64,10 @@ $$\text{FLOPs}_{QKV} = 3 \times 17.18 \times 10^9 = 51.54 \text{ GFLOPs}$$
 **Bytes** per projection (weights loaded once, activation input read, output written):
 $$\text{Bytes}_{W_Q} = \underbrace{d^2 \times 2}_{\text{weight}} + \underbrace{S \times d \times 2}_{\text{input}} + \underbrace{S \times d \times 2}_{\text{output}}$$
 $$= 4096^2 \times 2 + 512 \times 4096 \times 2 + 512 \times 4096 \times 2$$
-$$= 33,554,432 + 4,194,304 + 4,194,304 = 41,943,040 \approx 40.0\text{ MB}$$
+$$= 33,554,432 + 4,194,304 + 4,194,304 = 41,943,040 \approx 41.9\text{ MB}$$
 
 **Total (three projections)**:
-$$\text{Bytes}_{QKV} = 3 \times 40.0\text{ MB} = 120.0\text{ MB}$$
+$$\text{Bytes}_{QKV} = 3 \times 41.9\text{ MB} = 125.8\text{ MB}$$
 
 **Arithmetic intensity**:
 $$I_{QKV} = \frac{51.54 \times 10^9}{3 \times 41.943 \times 10^6} = \frac{51.54 \times 10^9}{125.83 \times 10^6} \approx \mathbf{409.6 \text{ FLOP/Byte}}$$
@@ -75,7 +75,7 @@ $$I_{QKV} = \frac{51.54 \times 10^9}{3 \times 41.943 \times 10^6} = \frac{51.54 
 $I_{QKV} = 409.6 > I^* = 156$ $\Rightarrow$ **Compute-bound**.
 
 **Approximation**: For large $d$ relative to $S$, weight bytes dominate:
-$I \approx \frac{2Sd^2}{d^2 \times 2} = S = 512$. This approximation gives the same answer here.
+$I \approx \frac{2Sd^2}{d^2 \times 2} = S = 512$. This is an upper bound: here the activation bytes are a quarter of the weight bytes, which pulls the true value down to 409.6. Either way the operation is compute-bound.
 
 ---
 
@@ -92,12 +92,12 @@ $$\text{FLOPs}_{QK^T} = h \times 67.11 \times 10^6 = 32 \times 67.11 \times 10^6
 **Bytes** (Q and K both loaded, score matrix written):
 $$\text{Bytes}_{QK^T} = \underbrace{S \times d \times 2}_{Q} + \underbrace{S \times d \times 2}_{K} + \underbrace{S^2 \times h \times 2}_{\text{scores}}$$
 $$= 512 \times 4096 \times 2 + 512 \times 4096 \times 2 + 512^2 \times 32 \times 2$$
-$$= 4,194,304 + 4,194,304 + 16,777,216 = 25,165,824 \approx 24.0\text{ MB}$$
+$$= 4,194,304 + 4,194,304 + 16,777,216 = 25,165,824 \approx 25.2\text{ MB}$$
 
 **Arithmetic intensity**:
-$$I_{QK^T} = \frac{2.15 \times 10^9}{25.17 \times 10^6} \approx \mathbf{85.4 \text{ FLOP/Byte}}$$
+$$I_{QK^T} = \frac{2.147 \times 10^9}{25.17 \times 10^6} \approx \mathbf{85.3 \text{ FLOP/Byte}}$$
 
-$I_{QK^T} = 85.4 < I^* = 156$ $\Rightarrow$ **Memory-bandwidth-bound** at $S=512$.
+$I_{QK^T} = 85.3 < I^* = 156$ $\Rightarrow$ **Memory-bandwidth-bound** at $S=512$.
 
 This is an important result: even in prefill, the $QK^T$ attention score computation is
 memory-bound at $S=512$. It becomes compute-bound only at larger $S$ (see Part 4).
@@ -113,9 +113,9 @@ $$\text{FLOPs}_{AV} = h \times 2 \times S \times S \times d_h = 2.15 \times 10^9
 
 **Bytes** (scores read, V loaded, output written):
 $$\text{Bytes}_{AV} = \underbrace{S^2 \times h \times 2}_{\text{scores}} + \underbrace{S \times d \times 2}_{V} + \underbrace{S \times d \times 2}_{\text{output}}$$
-$$= 16,777,216 + 4,194,304 + 4,194,304 = 25,165,824 \approx 24.0\text{ MB}$$
+$$= 16,777,216 + 4,194,304 + 4,194,304 = 25,165,824 \approx 25.2\text{ MB}$$
 
-$$I_{AV} \approx \mathbf{85.4 \text{ FLOP/Byte}} \quad \Rightarrow \text{Memory-bound}$$
+$$I_{AV} \approx \mathbf{85.3 \text{ FLOP/Byte}} \quad \Rightarrow \text{Memory-bound}$$
 
 Identical to $QK^T$ by symmetry of the problem.
 
@@ -136,22 +136,22 @@ SwiGLU has three matrices: $W_{\text{gate}}, W_{\text{up}} \in \mathbb{R}^{d \ti
 $W_{\text{down}} \in \mathbb{R}^{d_{ff} \times d}$.
 
 **Per projection** ($d \times d_{ff}$, input $\in \mathbb{R}^{S \times d}$):
-$$\text{FLOPs}_{\text{proj}} = 2 \times S \times d \times d_{ff} = 2 \times 512 \times 4096 \times 11008 = 46.18 \times 10^9$$
+$$\text{FLOPs}_{\text{proj}} = 2 \times S \times d \times d_{ff} = 2 \times 512 \times 4096 \times 11008 = 46.17 \times 10^9$$
 
 **Bytes** (weight + input + output):
 $$\text{Bytes}_{\text{proj}} = d \times d_{ff} \times 2 + S \times d \times 2 + S \times d_{ff} \times 2$$
 $$= 4096 \times 11008 \times 2 + 512 \times 4096 \times 2 + 512 \times 11008 \times 2$$
-$$= 90,177,536 + 4,194,304 + 11,272,192 = 105,644,032 \approx 100.8\text{ MB}$$
+$$= 90,177,536 + 4,194,304 + 11,272,192 = 105,644,032 \approx 105.6\text{ MB}$$
 
-$$I_{\text{gate/up}} = \frac{46.18 \times 10^9}{105.64 \times 10^6} \approx 437.2 \text{ FLOP/Byte}$$
+$$I_{\text{gate/up}} = \frac{46.17 \times 10^9}{105.64 \times 10^6} \approx 437.0 \text{ FLOP/Byte}$$
 
 **Down projection** ($d_{ff} \times d$, input $\in \mathbb{R}^{S \times d_{ff}}$):
-$$\text{FLOPs}_{\text{down}} = 2 \times S \times d_{ff} \times d = 46.18 \times 10^9 \quad \text{(same)}$$
+$$\text{FLOPs}_{\text{down}} = 2 \times S \times d_{ff} \times d = 46.17 \times 10^9 \quad \text{(same)}$$
 
 $$\text{Bytes}_{\text{down}} = d_{ff} \times d \times 2 + S \times d_{ff} \times 2 + S \times d \times 2$$
-$$= 90,177,536 + 11,272,192 + 4,194,304 = 105,644,032 \approx 100.8\text{ MB}$$
+$$= 90,177,536 + 11,272,192 + 4,194,304 = 105,644,032 \approx 105.6\text{ MB}$$
 
-$$I_{\text{down}} \approx 437.2 \text{ FLOP/Byte}$$
+$$I_{\text{down}} \approx 437.0 \text{ FLOP/Byte}$$
 
 All three FFN projections: $I_{\text{FFN}} \approx \mathbf{437\ \text{FLOP/Byte}} \Rightarrow$ **Compute-bound**.
 
@@ -171,9 +171,9 @@ $$\text{FLOPs}_{W_Q}^{\text{dec}} = 2 \times 1 \times d \times d = 2 \times 4096
 
 **Bytes**:
 $$\text{Bytes}_{W_Q}^{\text{dec}} = d^2 \times 2 + d \times 2 + d \times 2$$
-$$= 33,554,432 + 8,192 + 8,192 = 33,570,816 \approx 32.0\text{ MB}$$
+$$= 33,554,432 + 8,192 + 8,192 = 33,570,816 \approx 33.6\text{ MB}$$
 
-(Activation I/O is negligible: $2 \times d \times 2 = 16,384\text{ B} = 16\text{ KB} \ll 32\text{ MB}$ weights.)
+(Activation I/O is negligible: $2 \times d \times 2 = 16,384\text{ B} = 16\text{ KB} \ll 33.6\text{ MB}$ weights.)
 
 $$I_{QKV}^{\text{dec}} = \frac{33.55 \times 10^6}{33.57 \times 10^6} \approx \mathbf{0.999 \approx 1 \text{ FLOP/Byte}} \quad \Rightarrow \text{Severely memory-bound}$$
 
@@ -195,7 +195,7 @@ $$\text{FLOPs}_{qK^T}^{\text{dec}} = 32 \times 131,072 = 4.19 \times 10^6$$
 **Bytes** (load KV cache, load new query $q$, write score vector):
 $$\text{Bytes}_{qK^T}^{\text{dec}} = \underbrace{S_{\text{ctx}} \times d \times 2}_{K \text{ cache}} + \underbrace{d \times 2}_{q} + \underbrace{S_{\text{ctx}} \times h \times 2}_{\text{scores}}$$
 $$= 512 \times 4096 \times 2 + 4096 \times 2 + 512 \times 32 \times 2$$
-$$= 4,194,304 + 8,192 + 32,768 = 4,235,264 \approx 4.04\text{ MB}$$
+$$= 4,194,304 + 8,192 + 32,768 = 4,235,264 \approx 4.24\text{ MB}$$
 
 $$I_{qK^T}^{\text{dec}} = \frac{4.19 \times 10^6}{4.24 \times 10^6} \approx \mathbf{0.99 \approx 1 \text{ FLOP/Byte}} \quad \Rightarrow \text{Memory-bound}$$
 
@@ -212,7 +212,7 @@ $$\text{FLOPs}_{\text{head}} = 2 \times S_{\text{ctx}} \times d_h = 131,072 \qua
 
 **Bytes** (score loaded, V cache loaded, output vector written):
 $$\text{Bytes}_{AV}^{\text{dec}} = \underbrace{S_{\text{ctx}} \times h \times 2}_{\text{scores}} + \underbrace{S_{\text{ctx}} \times d \times 2}_{V \text{ cache}} + \underbrace{d \times 2}_{\text{output}}$$
-$$= 32,768 + 4,194,304 + 8,192 = 4,235,264 \approx 4.04\text{ MB}$$
+$$= 32,768 + 4,194,304 + 8,192 = 4,235,264 \approx 4.24\text{ MB}$$
 
 $$I_{AV}^{\text{dec}} \approx \mathbf{1 \text{ FLOP/Byte}} \quad \Rightarrow \text{Memory-bound}$$
 
@@ -224,7 +224,7 @@ $W_{\text{down}} \in \mathbb{R}^{d_{ff} \times d}$, input $x \in \mathbb{R}^{d_{
 
 $$\text{FLOPs} = 2 \times d_{ff} \times d = 2 \times 11008 \times 4096 = 90.18 \times 10^6$$
 
-$$\text{Bytes} = d_{ff} \times d \times 2 + d_{ff} \times 2 + d \times 2 = 90,177,536 + 22,016 + 8,192 \approx 86.0\text{ MB}$$
+$$\text{Bytes} = d_{ff} \times d \times 2 + d_{ff} \times 2 + d \times 2 = 90,177,536 + 22,016 + 8,192 \approx 90.2\text{ MB}$$
 
 $$I_{\text{FFN, down}}^{\text{dec}} = \frac{90.18 \times 10^6}{90.21 \times 10^6} \approx \mathbf{1 \text{ FLOP/Byte}} \quad \Rightarrow \text{Memory-bound}$$
 
@@ -239,14 +239,14 @@ All FFN projections in decode give $I \approx 1$ FLOP/Byte.
 | $W_Q$ projection | 409.6 | 1.0 | Compute | Memory BW |
 | $W_K$ projection | 409.6 | 1.0 | Compute | Memory BW |
 | $W_V$ projection | 409.6 | 1.0 | Compute | Memory BW |
-| $QK^T / qK^T$ | 85.4 | 1.0 | Memory BW | Memory BW |
-| $AV$ / score $\cdot V$ | 85.4 | 1.0 | Memory BW | Memory BW |
+| $QK^T / qK^T$ | 85.3 | 1.0 | Memory BW | Memory BW |
+| $AV$ / score $\cdot V$ | 85.3 | 1.0 | Memory BW | Memory BW |
 | $W_O$ projection | 409.6 | 1.0 | Compute | Memory BW |
-| $W_{\text{gate}}$ | 437.2 | 1.0 | Compute | Memory BW |
-| $W_{\text{up}}$ | 437.2 | 1.0 | Compute | Memory BW |
-| $W_{\text{down}}$ | 437.2 | 1.0 | Compute | Memory BW |
+| $W_{\text{gate}}$ | 437.0 | 1.0 | Compute | Memory BW |
+| $W_{\text{up}}$ | 437.0 | 1.0 | Compute | Memory BW |
+| $W_{\text{down}}$ | 437.0 | 1.0 | Compute | Memory BW |
 
-Ridge point $I^* = 156$ FLOP/Byte (Apex-1 equivalent, 312 TFLOP/s, 2 TB/s).
+Ridge point $I^* = 156$ FLOP/Byte (312 TFLOP/s, 2 TB/s).
 
 **Prefill**: Most operations are compute-bound. The attention score computation ($QK^T$)
 is an exception at $S=512$ — it is memory-bound for this model and sequence length.
@@ -327,19 +327,25 @@ Setting $I_{\text{combined}} = I^* = 156$:
 
 $$2NB + 4LS_{\text{ctx}}dB = 156(2N + 4LS_{\text{ctx}}dB)$$
 
-$$B(2N + 4LS_{\text{ctx}}d) = 156(2N + 4LS_{\text{ctx}}d)$$
+$$B(2N + 4LS_{\text{ctx}}d - 624LS_{\text{ctx}}d) = 312N$$
 
-$$\boxed{B = 156 = I^*}$$
+$$\boxed{B = \frac{156\,N}{N - 310\,LS_{\text{ctx}}d}}$$
 
-Wait — this simplifies perfectly because FLOPs and bytes share the same factor $(2N + 4LS_{\text{ctx}}d)$.
-This result means: **the ridge-point batch size is always exactly $I^*$, independent of
-sequence length or model size**, as long as all bandwidth sources (weights and KV) are in FP16.
+The FLOPs and bytes do **not** share a common factor: the weight bytes $2N$ are shared by all
+$B$ requests, but each request reads its own KV cache, so the KV term in the denominator grows
+with $B$. KV-cache reads stay at $\approx 1$ FLOP/Byte however large the batch. As $B \to \infty$:
 
-**Intuition**: When both FLOPs and bytes scale with the same factor $B$, and when FLOPs per
-byte is exactly $B$ (because FP16 weights give 1 FLOP per byte per request), the ridge point
-is always at $B = I^*$.
+$$I_{\text{combined}} \to \frac{2N + 4LS_{\text{ctx}}d}{4LS_{\text{ctx}}d} = 1 + \frac{N}{2LS_{\text{ctx}}d}$$
 
-**Numerical result for this accelerator**:
+With the layer weights of this model, $N = L(4d^2 + 3d\,d_{ff}) = 6.48 \times 10^9$:
+- A solution exists only if $S_{\text{ctx}} < N / (310\,L\,d) \approx 159$ tokens.
+- At $S_{\text{ctx}} = 512$ the combined intensity can never exceed $1 + 48.3 = 49.3$ FLOP/Byte,
+  so decode never reaches the ridge point, whatever the batch size.
+
+This is why MHA models are so hard to run efficiently at long context, and why GQA/MQA
+(fewer KV heads, so fewer KV bytes per token) matter.
+
+**Numerical result for this accelerator** (weights only, KV traffic ignored):
 $$B_{\text{ridge}} = I^* = \frac{312 \text{ TFLOP/s}}{2 \text{ TB/s}} = 156$$
 
 For INT8 weights ($\text{bpe} = 1$, so 2 FLOP/Byte per element per request):
@@ -357,25 +363,25 @@ Ridge point $I^* = 156$ FLOP/Byte.
 
 | Operation | Phase | FLOPs | Bytes | Intensity | Bottleneck |
 |---|---|---|---|---|---|
-| $W_Q$ GEMM | Prefill | 17.18 G | 40.0 MB | 429 | Compute |
-| $W_K$ GEMM | Prefill | 17.18 G | 40.0 MB | 429 | Compute |
-| $W_V$ GEMM | Prefill | 17.18 G | 40.0 MB | 429 | Compute |
-| $QK^T$ (scores) | Prefill | 2.15 G | 24.0 MB | 89.6 | Memory BW |
+| $W_Q$ GEMM | Prefill | 17.18 G | 41.9 MB | 409.6 | Compute |
+| $W_K$ GEMM | Prefill | 17.18 G | 41.9 MB | 409.6 | Compute |
+| $W_V$ GEMM | Prefill | 17.18 G | 41.9 MB | 409.6 | Compute |
+| $QK^T$ (scores) | Prefill | 2.15 G | 25.2 MB | 85.3 | Memory BW |
 | Softmax | Prefill | ~0.05 G | 16.8 MB | ~3 | Memory BW |
-| $AV$ (aggregation) | Prefill | 2.15 G | 24.0 MB | 89.6 | Memory BW |
-| $W_O$ GEMM | Prefill | 17.18 G | 40.0 MB | 429 | Compute |
-| $W_{\text{gate}}$ GEMM | Prefill | 46.18 G | 100.8 MB | 458 | Compute |
-| $W_{\text{up}}$ GEMM | Prefill | 46.18 G | 100.8 MB | 458 | Compute |
-| $W_{\text{down}}$ GEMM | Prefill | 46.18 G | 100.8 MB | 458 | Compute |
-| $W_Q$ GEMV | Decode | 33.6 M | 32.0 MB | 1.05 | Memory BW |
-| $W_K$ GEMV | Decode | 33.6 M | 32.0 MB | 1.05 | Memory BW |
-| $W_V$ GEMV | Decode | 33.6 M | 32.0 MB | 1.05 | Memory BW |
-| $qK^T$ (attention) | Decode | 4.19 M | 4.04 MB | 1.04 | Memory BW |
-| $AV$ (attention) | Decode | 4.19 M | 4.04 MB | 1.04 | Memory BW |
-| $W_O$ GEMV | Decode | 33.6 M | 32.0 MB | 1.05 | Memory BW |
-| $W_{\text{gate}}$ GEMV | Decode | 90.2 M | 86.0 MB | 1.05 | Memory BW |
-| $W_{\text{up}}$ GEMV | Decode | 90.2 M | 86.0 MB | 1.05 | Memory BW |
-| $W_{\text{down}}$ GEMV | Decode | 90.2 M | 86.0 MB | 1.05 | Memory BW |
+| $AV$ (aggregation) | Prefill | 2.15 G | 25.2 MB | 85.3 | Memory BW |
+| $W_O$ GEMM | Prefill | 17.18 G | 41.9 MB | 409.6 | Compute |
+| $W_{\text{gate}}$ GEMM | Prefill | 46.17 G | 105.6 MB | 437.0 | Compute |
+| $W_{\text{up}}$ GEMM | Prefill | 46.17 G | 105.6 MB | 437.0 | Compute |
+| $W_{\text{down}}$ GEMM | Prefill | 46.17 G | 105.6 MB | 437.0 | Compute |
+| $W_Q$ GEMV | Decode | 33.6 M | 33.6 MB | 1.00 | Memory BW |
+| $W_K$ GEMV | Decode | 33.6 M | 33.6 MB | 1.00 | Memory BW |
+| $W_V$ GEMV | Decode | 33.6 M | 33.6 MB | 1.00 | Memory BW |
+| $qK^T$ (attention) | Decode | 4.19 M | 4.24 MB | 0.99 | Memory BW |
+| $AV$ (attention) | Decode | 4.19 M | 4.24 MB | 0.99 | Memory BW |
+| $W_O$ GEMV | Decode | 33.6 M | 33.6 MB | 1.00 | Memory BW |
+| $W_{\text{gate}}$ GEMV | Decode | 90.2 M | 90.2 MB | 1.00 | Memory BW |
+| $W_{\text{up}}$ GEMV | Decode | 90.2 M | 90.2 MB | 1.00 | Memory BW |
+| $W_{\text{down}}$ GEMV | Decode | 90.2 M | 90.2 MB | 1.00 | Memory BW |
 
 ---
 

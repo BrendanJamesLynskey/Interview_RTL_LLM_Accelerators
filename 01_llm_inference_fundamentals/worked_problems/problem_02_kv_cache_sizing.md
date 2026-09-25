@@ -65,16 +65,16 @@ $$= 855,654,400 \approx 855.7\text{M parameters per layer}$$
 **Total layer parameters** ($L = 80$ layers):
 $$N_{\text{layers}} = 80 \times 855,654,400 = 68,452,352,000 \approx 68.5\text{B}$$
 
-**Embedding and head** ($V \times d$, typically weight-tied):
-$$N_{\text{embed}} = 32000 \times 8192 = 262,144,000 \approx 262\text{M}$$
+**Embedding and head** ($2 \times V \times d$; LLaMA-2 does **not** tie the input embedding and LM head):
+$$N_{\text{embed}} = 2 \times 32000 \times 8192 = 524,288,000 \approx 0.52\text{B}$$
 
 **Total parameters**:
-$$N_{\text{total}} \approx 68.5\text{B} + 0.26\text{B} \approx 68.8\text{B} \approx 70\text{B}$$
+$$N_{\text{total}} \approx 68.45\text{B} + 0.52\text{B} \approx 68.98\text{B} \approx 70\text{B}$$
 
-(The "70B" label is approximate — actual LLaMA-2 70B is 69.7B non-embedding parameters.)
+(The "70B" label is approximate — actual LLaMA-2 70B has about 69.0B parameters in total.)
 
 **Weight memory at FP16**:
-$$M_{\text{weights}} = N_{\text{total}} \times 2\text{B} = 68.8 \times 10^9 \times 2 = 137.6\text{GB}$$
+$$M_{\text{weights}} = N_{\text{total}} \times 2\text{B} = 68.98 \times 10^9 \times 2 = 137.95\text{GB}$$
 
 ---
 
@@ -128,19 +128,19 @@ Total HBM memory must accommodate: weights + KV cache + activations (small, $\ll
 $$M_{\text{HBM}} = M_{\text{weights}} + M_{\text{KV}}(B_{\max}, S) + M_{\text{activations}}$$
 
 Available for KV cache:
-$$M_{\text{KV, available}} = 160\text{GB} - 137.6\text{GB} = 22.4\text{GB}$$
+$$M_{\text{KV, available}} = 160\text{GB} - 137.95\text{GB} = 22.05\text{GB}$$
 
-$$B_{\max}(S) = \left\lfloor \frac{22.4 \times 10^9}{S \times 327,680} \right\rfloor$$
+$$B_{\max}(S) = \left\lfloor \frac{22.05 \times 10^9}{S \times 327,680} \right\rfloor$$
 
 | $S$ | $B_{\max}$ | Calculation |
 |---|---|---|
-| 512 | **133** | $22.4\text{GB} / 167.8\text{MB} = 133.5$ |
-| 2048 | **33** | $22.4\text{GB} / 671.1\text{MB} = 33.4$ |
-| 4096 | **16** | $22.4\text{GB} / 1342.2\text{MB} = 16.7$ |
-| 8192 | **8** | $22.4\text{GB} / 2684.4\text{MB} = 8.35$ |
+| 512 | **131** | $22.05\text{GB} / 167.8\text{MB} = 131.4$ |
+| 2048 | **32** | $22.05\text{GB} / 671.1\text{MB} = 32.9$ |
+| 4096 | **16** | $22.05\text{GB} / 1342.2\text{MB} = 16.4$ |
+| 8192 | **8** | $22.05\text{GB} / 2684.4\text{MB} = 8.21$ |
 
 **Key observation**: As sequence length quadruples ($512 \to 2048$), the maximum batch size
-decreases proportionally ($133 \to 33 \approx 133/4$). The KV cache memory scales as
+decreases proportionally ($131 \to 32 \approx 131/4$). The KV cache memory scales as
 $B \times S$, so longer sequences directly reduce the viable batch size.
 
 **Practical headroom**: In practice, reserve $5\text{–}10\%$ of HBM for:
@@ -149,9 +149,9 @@ $B \times S$, so longer sequences directly reduce the viable batch size.
 - PagedAttention block table metadata
 - Safety margin for fragmentation
 
-With 10% reserved: $M_{\text{KV, available}} \approx 22.4 - 16 = 6.4\text{GB}$ in the extreme,
+With 10% reserved: $M_{\text{KV, available}} \approx 22.05 - 16 = 6.05\text{GB}$ in the extreme,
 but more realistically activations are $\sim 500\text{MB}$, overhead $\sim 1\text{GB}$, so
-effective available $\approx 20.9\text{GB}$.
+effective available $\approx 20.55\text{GB}$.
 
 ---
 
@@ -167,8 +167,8 @@ This is identical to the total KV cache size — the entire cache is read once p
 **KV bandwidth dominates weight bandwidth when**:
 
 $$M_{\text{KV}}(B,S) > M_{\text{weights}}$$
-$$B \times S \times 327,680 > 137,600,000,000$$
-$$B \times S > \frac{137.6 \times 10^9}{327,680} = 419,979 \approx 420,000$$
+$$B \times S \times 327,680 > 137,953,280,000$$
+$$B \times S > \frac{137.95 \times 10^9}{327,680} = 421,000$$
 
 Equivalently: $B \times S > \frac{M_{\text{weights}}}{2 L h_{KV} d_h \times \text{bpe}}$
 
@@ -176,16 +176,16 @@ Equivalently: $B \times S > \frac{M_{\text{weights}}}{2 L h_{KV} d_h \times \tex
 
 | $B$ | $S$ at crossover | Nearest standard $S$ |
 |---|---|---|
-| 1 | 420,000 | Not reachable (>max context) |
-| 8 | 52,500 | 65,536 (would be KV-dominated) |
-| 32 | 13,125 | 16,384 |
-| 64 | 6,563 | 8,192 |
-| 128 | 3,281 | 4,096 |
+| 1 | 421,000 | Not reachable (>max context) |
+| 8 | 52,625 | 65,536 (would be KV-dominated) |
+| 32 | 13,156 | 16,384 |
+| 64 | 6,578 | 8,192 |
+| 128 | 3,289 | 4,096 |
 
 **Insight from GQA**: If we had used MHA ($h_{KV} = 64$) instead of GQA-8:
 $$M_{\text{KV, MHA, per token}} = 2 \times 80 \times 64 \times 128 \times 2 = 2,621,440\text{B} \approx 2.5\text{MB/token}$$
 
-Crossover with MHA: $B \times S > \frac{137.6\text{GB}}{2.5\text{MB}} = 55,040$, i.e. 8× lower
+Crossover with MHA: $B \times S > \frac{137.95 \times 10^9\text{B}}{2,621,440\text{B}} = 52,625$, i.e. 8× lower
 crossover than GQA-8, meaning MHA becomes KV-bandwidth-dominated at much smaller batch/context sizes.
 
 ---
@@ -198,14 +198,14 @@ Halve the bytes per element: $\text{bpe} = 1$ instead of $2$.
 
 $$M_{\text{KV, INT8}}(S) = S \times 163,840\text{B/token} = \frac{S \times 327,680}{2}$$
 
-New capacity (same 22.4 GB available):
+New capacity (same 22.05 GB available):
 $$B_{\max}^{\text{INT8}}(S) = 2 \times B_{\max}^{\text{FP16}}(S)$$
 
 | $S$ | FP16 $B_{\max}$ | INT8 $B_{\max}$ | Gain |
 |---|---|---|---|
-| 512 | 133 | 267 | $2\times$ |
-| 2048 | 33 | 66 | $2\times$ |
-| 4096 | 16 | 33 | $\approx 2\times$ |
+| 512 | 131 | 262 | $2\times$ |
+| 2048 | 32 | 65 | $\approx 2\times$ |
+| 4096 | 16 | 32 | $2\times$ |
 | 8192 | 8 | 16 | $2\times$ |
 
 Bandwidth per decode step is also halved proportionally.
@@ -227,7 +227,7 @@ with minimal overhead when done in the memory-fetch pipeline.
 
 Aggressive: $0.5$ bytes per element — $4\times$ size reduction from FP16.
 
-$$B_{\max}^{\text{INT4}}(S = 2048) = 4 \times 33 = 132$$
+$$B_{\max}^{\text{INT4}}(S = 2048) = \lfloor 4 \times 32.85 \rfloor = 131$$
 
 Accuracy degradation becomes significant without careful per-token, per-channel quantisation.
 KIVI and similar methods show INT4 KV with group quantisation can achieve acceptable accuracy.
@@ -236,10 +236,10 @@ KIVI and similar methods show INT4 KV with group quantisation can achieve accept
 
 | KV Precision | Relative size | Max batch ($S=2048$, 160 GB) |
 |---|---|---|
-| FP16 | $1\times$ | 33 |
-| BF16 | $1\times$ | 33 |
-| FP8 / INT8 | $0.5\times$ | 66 |
-| INT4 | $0.25\times$ | 132 |
+| FP16 | $1\times$ | 32 |
+| BF16 | $1\times$ | 32 |
+| FP8 / INT8 | $0.5\times$ | 65 |
+| INT4 | $0.25\times$ | 131 |
 
 ---
 
@@ -269,8 +269,8 @@ Pages are allocated on demand as the sequence grows.
 **Fragmentation analysis** for block size $P = 16$:
 
 In the worst case, the last page of each sequence is only 1 token full (15 tokens wasted).
-For a batch of $B=32$ sequences: $32 \times 15 \times 163,840\text{B} \approx 75\text{MB}$ wasted.
-This is $75\text{MB} / 22.4\text{GB} = 0.33\%$ overhead — negligible.
+For a batch of $B=32$ sequences (INT8 KV, $163,840$ B/token): $32 \times 15 \times 163,840\text{B} \approx 78.6\text{MB}$ wasted.
+This is $78.6\text{MB} / 22.05\text{GB} = 0.36\%$ overhead — negligible.
 
 For block size $P = 16$: average waste = $P/2 = 8$ tokens per sequence.
 
@@ -311,13 +311,13 @@ $$= 2 \times 80 \times 8 \times 128 \times 2 = 327,680 \text{ B} \approx 320 \te
 
 **Available KV memory** on a 160 GB system:
 
-$$M_{\text{KV, avail}} = 160\text{ GB} - M_{\text{weights}} = 160 - 137.6 = 22.4\text{ GB}$$
+$$M_{\text{KV, avail}} = 160\text{ GB} - M_{\text{weights}} = 160 - 137.95 = 22.05\text{ GB}$$
 
 **Maximum concurrent tokens** (FP16 KV):
 
-$$T_{\max} = \left\lfloor\frac{22.4\text{ GB}}{320\text{ KB}}\right\rfloor = 71,680 \text{ tokens}$$
+$$T_{\max} = \left\lfloor\frac{22.05 \times 10^9\text{ B}}{327,680\text{ B}}\right\rfloor = 67,281 \text{ tokens}$$
 
-This 71,680-token budget is shared across all sequences in the batch. Whether it is
+This 67,281-token budget is shared across all sequences in the batch. Whether it is
 spent on more sequences or longer sequences is a scheduling decision:
 - $32 \times 2048 = 65,536$ tokens: fits.
 - $16 \times 4096 = 65,536$ tokens: also fits.

@@ -190,7 +190,7 @@ roofline model?
 `Performance = min(Peak FLOP/s, Arithmetic Intensity x Peak Bandwidth)`
 
 A team doubles the on-chip SRAM, effectively doubling the operational intensity of a tiled kernel.
-If the kernel was previously memory-bound at 50% of peak compute, what happens?
+If the kernel was previously memory-bound at 30% of peak compute, what happens?
 
 - A) Throughput doubles regardless of whether the kernel was memory-bound
 - B) Throughput doubles only if the new operating point is still below the ridge point
@@ -240,23 +240,11 @@ for a single-vector input?
 ### Q1 — Correct: A
 
 The weight matrix is 4096 x 4096 = 16,777,216 elements. At FP16 (2 bytes each), this is
-33,554,432 bytes = **32 MB**.
+33,554,432 bytes = **32 MiB** (33.6 MB).
 
-The compute for a matrix-vector multiply is 2 x M x N FLOPs = 2 x 4096 x 4096 ≈ 33.6 GFLOP.
-Wait — re-examining: that gives 33.6 G / 32 M ≈ 1050 FLOP/byte for batch size > 1. But for a
-single vector (batch=1, decode), the multiply is M x N = 16.8 M multiplications and 16.8 M
-additions = 33.6 GFLOP, and the weight bytes read is 32 MB, giving ~1050 FLOP/byte.
-
-Correction: The question asks for bytes read and approximate intensity. Weights = 32 MB (correct).
-The input vector is 4096 x 2 bytes = 8 KB (negligible). Output is also negligible.
-FLOPs = 2 x 4096 x 4096 = 33.55 GFLOP.
-Intensity = 33.55 GFLOP / 32 MB ≈ 1048 FLOP/byte.
-
-**B is the closest answer** — 32 MB read, ~1 FLOP/byte is actually closest to A, but re-reading
-option A says "≈ 1 FLOP/byte" and option B says "≈ 0.5 FLOP/byte". The true value ≈ 1048
-FLOP/byte for a batched GEMM but for batch=1 decode the _effective_ intensity considering that each
-weight byte is read once per output element is: we have 4096 output elements each consuming 4096
-weight multiplies. Intensity = (2 x 4096 x 4096 FLOPs) / (4096 x 4096 x 2 bytes) = 2/2 = 1
+For a single vector (batch=1, decode), the multiply is 16.8 M multiplications and 16.8 M
+additions: FLOPs = 2 x 4096 x 4096 = 33.6 MFLOP. The input vector (4096 x 2 bytes = 8 KB) and the
+output are negligible. Intensity = (2 x 4096 x 4096 FLOPs) / (4096 x 4096 x 2 bytes) = 2/2 = 1
 FLOP/byte. **Answer A is correct: 32 MB, ~1 FLOP/byte.**
 
 - B incorrect: 0.5 FLOP/byte would correspond to only multiplications without additions, which is
@@ -292,8 +280,8 @@ FLOP/byte.
 
 A large prefill GEMM (sequence 2048, large hidden dim) achieves arithmetic intensity = 2 x seq x d
 FLOPs / (weight bytes + activation bytes). With seq=2048 and d=4096, the weight matrix reads are
-amortised over 2048 input rows, giving intensity ≈ 2048 FLOP/byte — far above the ridge point
-on nearly any accelerator.
+amortised over 2048 input rows, giving intensity ≈ 1024 FLOP/byte (≈ 2048 if only weight bytes
+are counted) — far above the ridge point on nearly any accelerator.
 
 - A incorrect: Loading the KV cache is nearly pure memory bandwidth with almost zero compute,
   giving intensity approaching 0.
@@ -335,7 +323,7 @@ time caused by variable-length sequences.
 - A incorrect: Continuous batching does not eliminate the KV cache; the KV cache is still necessary
   and is managed per-sequence.
 - C incorrect: Continuous batching is about dynamic batch membership, not splitting prefill and
-  decode across hardware units (that is speculative decoding or pipeline parallelism).
+  decode across hardware units (that is disaggregated prefill/decode serving).
 - D incorrect: Delta encoding of the KV cache is unrelated to scheduling strategy.
 
 ### Q8 — Correct: C
@@ -364,10 +352,10 @@ real decode will be at least this slow.
 
 ### Q10 — Correct: D
 
-HBM3e (as used in NVIDIA H200 and AMD MI325X) delivers approximately 4.8 TB/s per device, the
-highest of these options as of early 2025.
+HBM3e (as used in NVIDIA H200 and AMD MI325X) delivers approximately 4.8 TB/s (H200) to
+6 TB/s (MI325X) per device, the highest of these options as of early 2025.
 
-- A incorrect: HBM2 provides ~1 TB/s per device (e.g., A100 40GB variant).
+- A incorrect: HBM2 provides ~1.6 TB/s per device (e.g., A100 40GB variant, 1,555 GB/s).
 - B incorrect: HBM2e provides ~2 TB/s (e.g., A100 80GB).
 - C incorrect: HBM3 provides ~3.35 TB/s (H100 SXM), which is less than HBM3e.
 
@@ -405,7 +393,7 @@ weight perturbations that compensate for the error introduced by quantising each
 - A incorrect: Knowledge distillation describes a separate family of methods (e.g., DistilBERT).
   GPTQ uses a calibration dataset to compute the Hessian but does not train a teacher-student pair.
 - C incorrect: End-to-end fine-tuning with quantisation-aware training (QAT) describes methods like
-  QLoRA or standard QAT, not GPTQ which is a one-shot post-training method.
+  standard QAT, not GPTQ which is a one-shot post-training method.
 - D incorrect: K-means weight clustering describes product quantisation or vector quantisation
   methods (e.g., used in some early compression work), not GPTQ.
 
@@ -419,8 +407,8 @@ data movement is the bottleneck. This is the primary motivation.
   logic is not simpler — in fact, floating-point addition is more complex than integer addition
   because of exponent alignment.
 - C incorrect: While FP8 does have better precision for non-uniform distributions than INT8, calling
-  it "strictly superior in every dimension" is false — INT8 has wider dynamic range per bit because
-  it can represent integers exactly, and the claim about replacing SRAM is baseless.
+  it "strictly superior in every dimension" is false — INT8's uniform spacing gives finer
+  resolution than E4M3 near the top of its range, and integer MACs are cheaper in hardware.
 - D incorrect: FP8 affects the compute datapath and memory format, not the type of on-chip storage
   (SRAM vs. register file). SRAM is used for both.
 
@@ -437,31 +425,14 @@ capacity where weights are most dense, minimising mean squared quantisation erro
 - D incorrect: NF4 is a scalar quantisation format; it does not use entropy coding. Two 4-bit
   values are stored per byte (bit-packing), but this is memory layout, not entropy coding.
 
-### Q16 — Correct: C
+### Q16 — Correct: B
 
 Arithmetic intensity = 500 GFLOP / 2 GB = 250 FLOP/byte.
 
 Ridge-point intensity = 100 TFLOP/s / 1 TB/s = 100 FLOP/byte.
 
-Since 250 > 100, the kernel is **compute-bound**. Wait — re-examining: the kernel's intensity (250)
-exceeds the ridge point (100), so the kernel IS compute-bound. Predicted time = 500 GFLOP / 100
-TFLOP/s = 0.005 s = 5 ms.
-
-The memory time would be: 2 GB / 1 TB/s = 2 ms.
-
-Since compute-bound, time = 5 ms.
-
-**Correction: The correct answer is A (5 ms, compute-bound).**
-
-- A: 5 ms compute-bound — CORRECT.
-- B: 5 ms is the right time, but memory-bound is wrong. (This choice is listed as B = "5 ms,
-  compute-bound", which matches A in the original listing — see the option text.)
-- C: 2 ms memory-bound is incorrect — the kernel is compute-bound.
-- D: 5 ms memory-bound — the time is right but the bound characterisation is wrong.
-
-Re-reading the options: A = "2 ms (compute-bound)", B = "5 ms (compute-bound)", C = "2 ms
-(memory-bound)", D = "5 ms (memory-bound)". The correct answer is **B**: 5 ms, compute-bound.
-
+Since 250 > 100, the kernel is **compute-bound**. Predicted time = 500 GFLOP / 100
+TFLOP/s = 0.005 s = 5 ms. (The memory time would be 2 GB / 1 TB/s = 2 ms, which is shorter.)
 
 - A incorrect: 2 ms is the memory-bound prediction, and the kernel is compute-bound, so this is
   doubly wrong.
@@ -481,14 +452,14 @@ crosses the ridge, it becomes compute-bound and throughput does not fully double
 - C incorrect: SRAM affects tile size, which directly affects how many times each weight is reused
   per DRAM fetch, i.e., it affects operational intensity. The claim that SRAM has no effect is
   false.
-- D incorrect: There is no guarantee that doubling AI lands exactly at the ridge point; that would
-  be a coincidence.
+- D incorrect: Doubling AI from 30% of peak lands at 60% of peak, still below the ridge point;
+  it only lands exactly at the ridge if the kernel started at 50%.
 
 ### Q18 — Correct: B
 
 For a matrix-vector multiply with a single input vector, the weight matrix (M x N = 8192 x 4096
-elements x 2 bytes = 64 MB) is read once. The FLOPs are 2 x 8192 x 4096 ≈ 67 GFLOP. Arithmetic
-intensity = 67 GFLOP / 64 MB ≈ 1.05 FLOP/byte. The ridge point is 100 FLOP/byte, so the kernel
+elements x 2 bytes = 64 MiB = 67.1 MB) is read once. The FLOPs are 2 x 8192 x 4096 ≈ 67.1 MFLOP. Arithmetic
+intensity = 67.1 MFLOP / 67.1 MB ≈ 1.0 FLOP/byte. The ridge point is 100 FLOP/byte, so the kernel
 is far to the left — **memory-bound**.
 
 - A incorrect: The number of elements is irrelevant to whether a kernel is compute-bound. The

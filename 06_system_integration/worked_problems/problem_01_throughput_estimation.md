@@ -110,8 +110,8 @@ $$\text{FLOPs}_{layer} = \text{FLOPs}_{attn} + \text{FLOPs}_{FFN} = 138.5 + 270.
 $$\text{FLOPs}_{token} = 32 \times 409\ \text{MFLOPs} = 13.1\ \text{GFLOPs/token}$$
 
 **Rule of thumb check:** $\approx 2 \times \text{parameters} = 2 \times 6.74\ \text{B} = 13.5$ GFLOPs/token.
-Our calculated value of 13.1 GFLOPs/token is consistent (small discrepancy from context-length-
-dependent attention term).
+Our calculated value of 13.1 GFLOPs/token is consistent (the small discrepancy is the embedding and
+LM-head parameters, $2 \times 32000 \times 4096 \approx 0.26$B, which the per-layer sum does not count).
 
 ---
 
@@ -134,17 +134,17 @@ $$\text{Weight bytes per token} = \frac{W_{model}}{B_{dec}} = \frac{13.5\ \text{
 
 KV cache per layer per sequence, for $l_{ctx} = 256$ tokens at BF16:
 
-$$\text{KV per layer} = 2 \times n_h \times d_k \times l_{ctx} \times 2\ \text{B} = 2 \times 32 \times 128 \times 256 \times 2 = 4\ \text{MB}$$
+$$\text{KV per layer} = 2 \times n_h \times d_k \times l_{ctx} \times 2\ \text{B} = 2 \times 32 \times 128 \times 256 \times 2 = 4,194,304\ \text{B} \approx 4.19\ \text{MB}$$
 
 Total KV read for all 32 layers, for all 32 sequences:
 
-$$\text{KV traffic total} = 32 \times 4\ \text{MB} \times 32\ \text{sequences} = 4096\ \text{MB} = 4\ \text{GB}$$
+$$\text{KV traffic total} = 32 \times 4.19\ \text{MB} \times 32\ \text{sequences} \approx 4.29\ \text{GB}$$
 
-Per-token share: $\frac{4\ \text{GB}}{32\ \text{tokens}} = 128\ \text{MB/token}$.
+Per-token share: $\frac{4.29\ \text{GB}}{32\ \text{tokens}} = 134.2\ \text{MB/token}$.
 
 **Total memory traffic per token (decode):**
 
-$$B_{token} = 421.9 + 128 = 549.9\ \text{MB/token} \approx 550\ \text{MB/token}$$
+$$B_{token} = 421.9 + 134.2 = 556.1\ \text{MB/token} \approx 556\ \text{MB/token}$$
 
 ---
 
@@ -152,9 +152,9 @@ $$B_{token} = 421.9 + 128 = 549.9\ \text{MB/token} \approx 550\ \text{MB/token}$
 
 **Decode arithmetic intensity:**
 
-$$I_{decode} = \frac{\text{FLOPs/token}}{\text{bytes/token}} = \frac{13.1 \times 10^9\ \text{FLOP}}{550 \times 10^6\ \text{B}} \approx 23.8\ \text{FLOP/byte}$$
+$$I_{decode} = \frac{\text{FLOPs/token}}{\text{bytes/token}} = \frac{13.1 \times 10^9\ \text{FLOP}}{556 \times 10^6\ \text{B}} \approx 23.6\ \text{FLOP/byte}$$
 
-Since $I_{decode} = 23.8 < I^* = 183$:
+Since $I_{decode} = 23.6 < I^* = 183$:
 
 **The decode phase is MEMORY-BANDWIDTH-BOUND.**
 
@@ -166,11 +166,11 @@ $$I_{prefill} = \frac{B \times S \times \text{FLOPs/token}}{W_{model} + \text{KV
 
 KV write traffic during prefill (writing keys and values for all $B \times S$ tokens):
 
-$$\text{KV write} = 32\ \text{layers} \times 2 \times n_h \times d_k \times (B \times S) \times 2\ \text{B} = 32 \times 2 \times 32 \times 128 \times 8192 \times 2 = 4\ \text{GB}$$
+$$\text{KV write} = 32\ \text{layers} \times 2 \times n_h \times d_k \times (B \times S) \times 2\ \text{B} = 32 \times 2 \times 32 \times 128 \times 8192 \times 2 \approx 4.29\ \text{GB}$$
 
-$$I_{prefill} = \frac{8192 \times 13.1 \times 10^9}{13.5 \times 10^9 + 4 \times 10^9} = \frac{107.4\ \text{TFLOP}}{17.5\ \text{GB}} = 6137\ \text{FLOP/byte}$$
+$$I_{prefill} = \frac{8192 \times 13.1 \times 10^9}{13.5 \times 10^9 + 4.29 \times 10^9} = \frac{107.3\ \text{TFLOP}}{17.8\ \text{GB}} \approx 6030\ \text{FLOP/byte}$$
 
-Since $I_{prefill} = 6137 \gg I^* = 183$:
+Since $I_{prefill} \approx 6030 \gg I^* = 183$:
 
 **The prefill phase is COMPUTE-BOUND.**
 
@@ -182,13 +182,13 @@ Since $I_{prefill} = 6137 \gg I^* = 183$:
 
 The decode throughput is limited by HBM bandwidth:
 
-$$\text{Throughput}_{decode} = \frac{B_{mem}}{B_{token}} = \frac{1.638 \times 10^{12}\ \text{B/s}}{550 \times 10^6\ \text{B/token}} \approx 2978\ \text{tokens/s}$$
+$$\text{Throughput}_{decode} = \frac{B_{mem}}{B_{token}} = \frac{1.638 \times 10^{12}\ \text{B/s}}{556 \times 10^6\ \text{B/token}} \approx 2946\ \text{tokens/s}$$
 
 Accounting for ~85% HBM utilisation efficiency (bank conflicts, refresh overhead):
 
-$$\text{Throughput}_{decode,eff} \approx 0.85 \times 2978 \approx 2531\ \text{tokens/s}$$
+$$\text{Throughput}_{decode,eff} \approx 0.85 \times 2946 \approx 2504\ \text{tokens/s}$$
 
-**Per-sequence decode rate:** $2531 / 32 = 79\ \text{tokens/s per sequence}$.
+**Per-sequence decode rate:** $2504 / 32 = 78\ \text{tokens/s per sequence}$.
 
 This is consistent with observed performance on real hardware (A100 with 2 TB/s HBM achieves
 ~2800 tokens/s for LLaMA-2 7B at batch 32; our accelerator has ~82% of A100's HBM bandwidth).
@@ -197,9 +197,9 @@ This is consistent with observed performance on real hardware (A100 with 2 TB/s 
 
 Prefill is compute-bound. Peak throughput limited by TOPS:
 
-$$\text{FLOP/step} = B \times S \times \text{FLOPs/token} = 8192 \times 13.1\ \text{GFLOPs} \approx 107.4\ \text{TFLOPs}$$
+$$\text{FLOP/step} = B \times S \times \text{FLOPs/token} = 8192 \times 13.1\ \text{GFLOPs} \approx 107.3\ \text{TFLOPs}$$
 
-$$t_{prefill} = \frac{107.4\ \text{TFLOPs}}{300\ \text{TOPS}} \approx 358\ \text{ms}$$
+$$t_{prefill} = \frac{107.3\ \text{TFLOPs}}{300\ \text{TOPS}} \approx 358\ \text{ms}$$
 
 Accounting for ~70% MAC utilisation efficiency (pipeline fill, synchronisation overhead):
 
@@ -218,15 +218,15 @@ Can the 64 MB on-chip SRAM hold the active working set for decode?
 
 | Data | Size |
 |---|---|
-| One layer's weights (attention + FFN) | $2 \times (4 \times 4096^2 + 3 \times 4096 \times 11008) \times 2\ \text{B} = 2 \times (134.2 + 270.5)\ \text{MB} = 809\ \text{MB}$ |
+| One layer's weights (attention + FFN) | $(4 \times 4096^2 + 3 \times 4096 \times 11008) \times 2\ \text{B} = (134.2 + 270.5)\ \text{MB} = 405\ \text{MB}$ |
 | Attention activations per layer | $B_{dec} \times d \times 2\ \text{B} = 32 \times 4096 \times 2 = 256\ \text{KB}$ |
-| KV cache for current layer, all sequences | $2 \times n_h \times d_k \times l_{ctx} \times B_{dec} \times 2\ \text{B} = 4\ \text{MB}$ |
+| KV cache for current layer, all sequences | $2 \times n_h \times d_k \times l_{ctx} \times B_{dec} \times 2\ \text{B} \approx 134\ \text{MB}$ |
 
-The per-layer weight size (809 MB) is far larger than the 64 MB SRAM. **Model weights cannot be
+The per-layer weight size (405 MB) is far larger than the 64 MB SRAM. **Model weights cannot be
 staged in SRAM; they must be streamed from HBM.** The SRAM is used for:
 - Activations (256 KB) — fits easily.
 - Tile-level double-buffering of weight sub-matrices being loaded from HBM.
-- KV cache hot-working-set (~4 MB per layer, fits for one layer at a time).
+- KV cache tiles (4.2 MB per sequence per layer; the 134 MB for all 32 sequences does not fit, so it is streamed from HBM too).
 
 This confirms the decode phase is HBM-bandwidth-limited, not SRAM-limited.
 
@@ -237,7 +237,7 @@ This confirms the decode phase is HBM-bandwidth-limited, not SRAM-limited.
 | Phase | Bound by | Throughput | Latency per step |
 |---|---|---|---|
 | Prefill ($B=16$, $S=512$) | Compute (300 TOPS) | ~16,000 tokens/s | ~511 ms per prefill batch |
-| Decode ($B=32$) | HBM bandwidth (1.6 TB/s) | ~2,530 tokens/s | ~12.7 ms per decode step |
+| Decode ($B=32$) | HBM bandwidth (1.6 TB/s) | ~2,500 tokens/s | ~12.8 ms per decode step |
 
 **Roofline chart (qualitative):**
 
@@ -245,16 +245,16 @@ This confirms the decode phase is HBM-bandwidth-limited, not SRAM-limited.
 Perf
 (TOPS)
 300  ┤────────────────────────────────── peak compute
-     │                                 ╱ prefill (I=6137)  ← compute bound
+     │                                 ╱ prefill (I=6030)  ← compute bound
      │                               ╱
      │                             ╱
      │                           ╱
-  39 ┤- - - - - - - - - - - - -╱- - - - - -  decode effective (I=23.8)
+  39 ┤- - - - - - - - - - - - -╱- - - - - -  decode effective (I=23.6)
      │                       ╱
-     │                     ╱  decode (I=23.8)
+     │                     ╱  decode (I=23.6)
      │                   ╱
   0  └─────────────────────────────────────── I (FLOP/byte)
-     0        183       6137
+     0        183       6030
               I*
 ```
 
@@ -263,6 +263,9 @@ Perf
 1. Prefill is compute-bound; improving TOPS (not memory bandwidth) improves prefill latency.
 2. Decode is memory-bandwidth-bound; the only way to improve decode throughput is to increase HBM
    bandwidth or increase batch size (to share weight loading across more sequences).
-3. Increasing batch size from 32 to 64 would halve the weight bytes per token, improving decode
-   throughput by ~2× — as long as HBM capacity holds all KV caches (64 sequences × 2 GB KV each =
-   128 GB, exceeding the 96 GB HBM in this spec; therefore INT8 quantisation would be needed first).
+3. Increasing batch size from 32 to 64 would halve the weight bytes per token (421.9 → 210.9 MB),
+   but the 134 MB/token of KV reads does not shrink, so decode throughput improves by only ~1.6×
+   (to ≈4,030 tokens/s). HBM capacity is not the limit at a 256-token context: 64 sequences need
+   only 8.6 GB of KV cache. At the full 4096-token context, however, each sequence needs 2.1 GB of
+   KV, so 64 sequences need 137 GB, exceeding the 96 GB HBM in this spec; INT8 KV quantisation
+   would then be needed first.

@@ -285,7 +285,7 @@ input activation feed. What does skewing refer to, and why is it needed?
 | 15 | B      |
 | 16 | C      |
 | 17 | B      |
-| 18 | C      |
+| 18 | A      |
 | 19 | B      |
 | 20 | A      |
 
@@ -351,7 +351,7 @@ Correct answer is **D: 16 + ceil(log2(K))**.
 
 
 - A incorrect: 8 bits cannot hold even a single product of two INT8 values in general (max product
-  magnitude is 16384 which requires 15 bits signed).
+  magnitude is 16384 = (-128) x (-128), which requires 16 bits signed).
 - B incorrect: 16 bits holds one product but overflows when accumulating more than one term with
   maximum values.
 - C incorrect: 8 + ceil(log2(K)) understates the required width by 8 bits, forgetting that the
@@ -524,20 +524,19 @@ acc3 are summed to produce the final result.
 - D incorrect: Speculative execution of the accumulator value is not practical for arithmetic
   circuits where the value is data-dependent and unpredictable.
 
-### Q18 — Correct: C
+### Q18 — Correct: A
 
-In SystemVerilog, signed multiplication of two 8-bit signed values produces a 16-bit signed result
-(the tool handles sign extension based on the signedness of operands). When this 16-bit result is
-added to a 32-bit acc, the tool sign-extends the 16-bit value to 32 bits before adding. This is
-functionally correct, but whether the intermediate result is exactly 16 bits or is promoted earlier
-is technically tool-dependent and is a known source of subtle simulation-synthesis mismatches.
+SystemVerilog sizes this expression by context (IEEE 1800-2017, §11.6): the operands of `*` and
+`+` are context-determined, so `a` and `b` are extended to the 32-bit width of `acc` *before* the
+multiply. Because every operand is signed, the result is signed and the extension is a sign
+extension (§11.8). The code therefore computes the full signed product and accumulates it
+correctly as written. This behaviour is defined by the standard, not tool-dependent.
 
-- A incorrect: While the functional result is often correct, saying SystemVerilog "automatically"
-  handles this without caveats is imprecise; the promotion rules are defined but tool behaviour
-  on expression width can vary.
-- B incorrect: The assignment to a 32-bit acc does not require an explicit cast for correctness;
-  sign extension happens implicitly. The concern is the intermediate product width, not the
-  assignment.
+- B incorrect: `a * b` is not evaluated at 16 bits here; it is evaluated at the 32-bit context
+  width, and no explicit cast is needed.
+- C incorrect: The widening is not implementation-defined; the LRM specifies it. (A real pitfall
+  is mixing signed and unsigned operands: if any operand were unsigned, the whole expression
+  would be treated as unsigned and zero-extended.)
 - D incorrect: The `en` signal controls the flip-flop enable, not a latch. `always_ff` blocks are
   synthesised to flip-flops by definition, and a conditional assignment within `always_ff` with
   an enable is standard clock-gating inference, not an error.

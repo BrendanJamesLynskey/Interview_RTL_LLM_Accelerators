@@ -406,9 +406,8 @@ Total memory = 3 * T^2 * 2 bytes <= S. This gives T <= sqrt(S / 6).
 
 - A incorrect: Only fitting the output tile would allow T^2 * 2 = S, giving a much larger T —
   but A and B tiles would overflow SRAM during computation.
-- C incorrect: "3 * T^2 * 2 with a factor 3 safety margin" would give T^2 * 6 * 2 = T^2 * 12,
-  which is overly conservative and equal to option B only if the safety margin is included in
-  the formula differently.
+- C incorrect: T^2 * 6 is numerically the same as option B, but the stated reasoning is wrong:
+  the factor of 3 is the number of tiles (A, B and C), not a safety margin.
 - D incorrect: Option D states it is equivalent to B, which is correct as a mathematical statement.
   However, the question asks for a single best answer characterising the constraint, and option B
   is the direct statement of that constraint without a dependency on another option's correctness.
@@ -560,8 +559,9 @@ bank 0. Every access in the stride-16 pattern hits bank 0: 100% conflict rate.
 
 ### Q19 — Correct: B
 
-XOR-based scrambling computes the bank index as: `bank = (addr >> log2(bank_size)) XOR (addr >> (log2(bank_size) + log2(num_banks)))`. This introduces a folding effect that breaks the regular
-mapping of power-of-two strides. A stride-16 pattern across 16 banks with XOR scrambling maps
+XOR-based scrambling computes the bank index as: `bank = (addr XOR (addr >> log2(num_banks))) mod num_banks`.
+This introduces a folding effect that breaks the regular mapping of power-of-two strides: with 16
+banks, address 16k maps to bank (0 XOR k) mod 16 = k mod 16. A stride-16 pattern across 16 banks with XOR scrambling maps
 to all 16 banks.
 
 - A incorrect: Swapping row and column indices is a transpose, which is a valid technique for
