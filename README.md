@@ -143,6 +143,8 @@ This repository is designed as an interview preparation guide for RTL design eng
 
 - **[Interview_Digital_Hardware_Design](https://github.com/BrendanJamesLynskey/Interview_Digital_Hardware_Design)** — Foundational digital design, logic optimization, and hardware design methodology.
 
+- **[SystemVerilog_Simulators](https://github.com/BrendanJamesLynskey/SystemVerilog_Simulators)** — Which free simulators (Icarus, Verilator, Vivado xsim, Questa Starter) can run the coding challenges in this repository, what each one rejects, and the status of every challenge.
+
 ## Contributing
 
 Contributions are welcome. This repository is a study resource, and improvements that clarify concepts, add depth to explanations, or extend coverage to additional accelerator architectures are valuable.
