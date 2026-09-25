@@ -37,12 +37,16 @@
 // The controller accepts commands via a command FIFO:
 //   cmd_type:  2'b00 = PREFILL, 2'b01 = DECODE_APPEND, 2'b10 = ATTN_READ
 //   cmd_layer: which transformer layer
-//   cmd_pos:   start position (PREFILL/DECODE) or read start pos (ATTN_READ)
-//   cmd_len:   number of tokens (PREFILL: > 1; DECODE: always 1; ATTN_READ: cur_seq_len)
+//   cmd_pos:   start position (PREFILL) or read start pos (ATTN_READ);
+//              ignored by DECODE_APPEND, which appends at cur_seq_len
+//   cmd_len:   number of tokens (PREFILL: >= 1; DECODE: ignored, always 1;
+//              ATTN_READ: typically cur_seq_len). 0 = no-op for PREFILL/ATTN_READ
 //   cmd_kv:    1=read K only, 0=read V only, X for writes (writes always write both K+V)
 //
-// Write data is presented on wr_data (DATA_WIDTH bits wide) with wr_valid/wr_ready handshake.
-// Read data is presented on rd_data (DATA_WIDTH bits wide) with rd_valid output.
+// Write data is presented on wr_data (DATA_WIDTH bits wide) with wr_valid/wr_ready handshake
+// (one beat is written on every cycle both are high).
+// Read data is presented on rd_data (DATA_WIDTH bits wide) with rd_valid output,
+// one beat per cycle; rd_last marks the final beat of each ATTN_READ.
 //
 // PARAMETERS
 // ----------
@@ -56,9 +60,12 @@
 // -----------
 // - HEAD_DIM must be a multiple of (DATA_WIDTH / 16) so that one head's K or V
 //   vector transfers in an integer number of DATA_WIDTH-wide beats.
-// - The controller maintains a cur_seq_len register that is incremented by
-//   DECODE_APPEND and set by PREFILL. Reset on rst_n.
-// - ATTN_READ has lower priority than DECODE_APPEND (write beats read).
+// - The controller maintains a cur_seq_len register, set to cmd_pos + cmd_len by
+//   PREFILL (issued once per layer over the same positions) and incremented by
+//   the DECODE_APPEND for the last layer (NUM_LAYERS-1): a decode step appends
+//   each layer's K/V at the same position cur_seq_len. Reset on rst_n.
+// - Commands execute strictly in FIFO order, one at a time, so an ATTN_READ
+//   issued after a DECODE_APPEND sees the appended token.
 // =============================================================================
 
 `default_nettype none
@@ -259,9 +266,12 @@ module kv_cache_controller #(
     // -----------------------------------------------------------------------
     // Command FIFO
     // Pack command fields into CMD_BITS-wide word
-    // Format: [1:0] type | [6:2] layer | [17:7] pos | [28:18] len | [29] kv
+    // Format (LSB first): type[1:0] | layer | pos | len | kv
+    // (field widths follow the parameters: LAYER_BITS, POS_BITS)
     // -----------------------------------------------------------------------
-    localparam int CMD_BITS = 30;
+    localparam int LAYER_BITS = $clog2(NUM_LAYERS);
+    localparam int POS_BITS   = $clog2(MAX_SEQ_LEN);
+    localparam int CMD_BITS   = 3 + LAYER_BITS + 2 * POS_BITS;
     wire [CMD_BITS-1:0] cmd_packed;
     wire [CMD_BITS-1:0] cmd_fifo_dout;
     wire                cmd_fifo_empty, cmd_fifo_full;
@@ -270,15 +280,12 @@ module kv_cache_controller #(
     assign cmd_packed = {cmd_kv, cmd_len, cmd_pos, cmd_layer, cmd_type};
     assign cmd_ready  = !cmd_fifo_full;
 
-    // Unpack current command from FIFO head
-    wire [1:0]  cur_cmd_type  = cmd_fifo_dout[1:0];
-    wire [$clog2(NUM_LAYERS)-1:0]  cur_cmd_layer =
-        cmd_fifo_dout[1 + $clog2(NUM_LAYERS) : 2];
-    wire [$clog2(MAX_SEQ_LEN)-1:0] cur_cmd_pos   =
-        cmd_fifo_dout[1 + $clog2(NUM_LAYERS) + $clog2(MAX_SEQ_LEN) : 2 + $clog2(NUM_LAYERS)];
-    wire [$clog2(MAX_SEQ_LEN)-1:0] cur_cmd_len   =
-        cmd_fifo_dout[1 + $clog2(NUM_LAYERS) + 2*$clog2(MAX_SEQ_LEN) : 2 + $clog2(NUM_LAYERS) + $clog2(MAX_SEQ_LEN)];
-    wire                           cur_cmd_kv    = cmd_fifo_dout[CMD_BITS-1];
+    // Unpack the command at the FIFO head
+    wire [1:0]            head_type  = cmd_fifo_dout[1:0];
+    wire [LAYER_BITS-1:0] head_layer = cmd_fifo_dout[2 +: LAYER_BITS];
+    wire [POS_BITS-1:0]   head_pos   = cmd_fifo_dout[2 + LAYER_BITS +: POS_BITS];
+    wire [POS_BITS-1:0]   head_len   = cmd_fifo_dout[2 + LAYER_BITS + POS_BITS +: POS_BITS];
+    wire                  head_kv    = cmd_fifo_dout[CMD_BITS-1];
 
     cmd_fifo #(
         .DEPTH   (8),
@@ -308,24 +315,35 @@ module kv_cache_controller #(
     state_t state;
 
     // -----------------------------------------------------------------------
-    // Operation counters
+    // Operation registers
     // -----------------------------------------------------------------------
-    // Tracks current position and beat within an active write or read operation
-    reg [$clog2(MAX_SEQ_LEN)-1:0]   op_pos;       // Current token position
-    reg [$clog2(BEATS_PER_TOKEN):0]  op_beat;      // Beat within current token
-    reg [$clog2(MAX_SEQ_LEN)-1:0]   op_remaining; // Tokens remaining
-    reg [$clog2(BEATS_PER_TOKEN):0]  kv_offset;   // 0 for K, BEATS_PER_KV for V
+    // The command is popped from the FIFO when it starts and its fields are
+    // held here for the whole operation (so the next command can never be
+    // started twice or mixed into this one).
+    reg [LAYER_BITS-1:0]            op_layer;     // Layer of the active command
+    reg [POS_BITS-1:0]              op_pos;       // Current token position
+    reg [$clog2(BEATS_PER_TOKEN):0] op_beat;      // Beat within current token
+    reg [POS_BITS-1:0]              op_remaining; // Tokens remaining
+    reg [$clog2(BEATS_PER_TOKEN):0] kv_offset;    // 0 for K, BEATS_PER_KV for V
+    reg [POS_BITS:0]                op_end;       // PREFILL: pos + len
+
+    // Start the head command when idle (pop it in the same cycle)
+    wire start_cmd = (state == S_IDLE) && !cmd_fifo_empty;
+    assign cmd_fifo_pop = start_cmd;
 
     // -----------------------------------------------------------------------
-    // Write control signals
+    // Write path: one beat per cycle on the wr_valid/wr_ready handshake,
+    // written straight into the SRAM at the address of the current beat.
+    // PREFILL writes at op_pos; DECODE_APPEND writes at position cur_seq_len.
     // -----------------------------------------------------------------------
-    reg                  wr_en_reg;
-    reg [ADDR_BITS-1:0]  wr_addr_reg;
+    wire wr_beat = wr_valid && wr_ready;
 
-    assign sram_wr_en   = wr_en_reg && wr_valid;
-    assign sram_wr_addr = wr_addr_reg;
+    assign wr_ready     = (state == S_PREFILL_WR || state == S_DECODE_WR);
+    assign sram_wr_en   = wr_beat;
+    assign sram_wr_addr = sram_addr(op_layer,
+                                    (state == S_DECODE_WR) ? seq_len_reg[POS_BITS-1:0] : op_pos,
+                                    op_beat);
     assign sram_wr_data = wr_data;
-    assign wr_ready     = (state == S_PREFILL_WR || state == S_DECODE_WR) && wr_en_reg;
 
     // -----------------------------------------------------------------------
     // Read control signals
@@ -333,6 +351,7 @@ module kv_cache_controller #(
     reg                  rd_req_reg;    // Assert SRAM rd_en
     reg [ADDR_BITS-1:0]  rd_addr_reg;  // SRAM read address
     reg                  rd_valid_reg; // Output valid (delayed by 1 cycle for SRAM latency)
+    reg                  rd_last_req;  // The request in flight is the final beat
     reg                  rd_last_reg;
 
     assign sram_rd_en   = rd_req_reg;
@@ -342,53 +361,49 @@ module kv_cache_controller #(
     assign rd_last      = rd_last_reg;
 
     // -----------------------------------------------------------------------
-    // Command completion: pop the FIFO when the operation finishes
-    // -----------------------------------------------------------------------
-    reg op_done;
-    assign cmd_fifo_pop = op_done;
-
-    // -----------------------------------------------------------------------
     // Main FSM
     // -----------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state        <= S_IDLE;
             seq_len_reg  <= '0;
-            wr_en_reg    <= 1'b0;
             rd_req_reg   <= 1'b0;
+            rd_addr_reg  <= '0;
             rd_valid_reg <= 1'b0;
+            rd_last_req  <= 1'b0;
             rd_last_reg  <= 1'b0;
-            op_done      <= 1'b0;
+            op_layer     <= '0;
             op_pos       <= '0;
             op_beat      <= '0;
             op_remaining <= '0;
             kv_offset    <= '0;
+            op_end       <= '0;
         end else begin
-            // Default pulse signals
-            op_done   <= 1'b0;
-            wr_en_reg <= 1'b0;
-
-            // Propagate SRAM read latency (1 cycle) to rd_valid
+            // Propagate SRAM read latency (1 cycle) to rd_valid / rd_last
             rd_valid_reg <= rd_req_reg;
-            rd_last_reg  <= 1'b0;
+            rd_last_reg  <= rd_req_reg && rd_last_req;
+            rd_req_reg   <= 1'b0;
+            rd_last_req  <= 1'b0;
 
             case (state)
                 // -----------------------------------------------------------
                 S_IDLE : begin
-                    rd_req_reg <= 1'b0;
-                    if (!cmd_fifo_empty) begin
+                    if (start_cmd) begin
                         // Decode and start the next command
-                        op_pos       <= cur_cmd_pos;
+                        op_layer     <= head_layer;
+                        op_pos       <= head_pos;
                         op_beat      <= '0;
-                        op_remaining <= cur_cmd_len;
-                        kv_offset    <= cur_cmd_kv ?
+                        op_remaining <= head_len;
+                        op_end       <= head_pos + head_len;
+                        kv_offset    <= head_kv ?
                                         '0 :              // K: offset=0
                                         BEATS_PER_KV[($clog2(BEATS_PER_TOKEN)):0]; // V: offset=BEATS_PER_KV
 
-                        case (cur_cmd_type)
-                            2'b00 : state <= S_PREFILL_WR;   // PREFILL
+                        case (head_type)
+                            // PREFILL / ATTN_READ of zero tokens complete at once
+                            2'b00 : state <= (head_len != 0) ? S_PREFILL_WR  : S_IDLE;
                             2'b01 : state <= S_DECODE_WR;    // DECODE_APPEND
-                            2'b10 : state <= S_ATTN_RD_REQ;  // ATTN_READ
+                            2'b10 : state <= (head_len != 0) ? S_ATTN_RD_REQ : S_IDLE;
                             default: state <= S_IDLE;
                         endcase
                     end
@@ -396,22 +411,17 @@ module kv_cache_controller #(
 
                 // -----------------------------------------------------------
                 // PREFILL WRITE
-                // Write BEATS_PER_TOKEN beats per token for op_remaining tokens.
-                // Accept wr_data each cycle wr_valid is asserted.
+                // Write BEATS_PER_TOKEN beats per token for op_remaining tokens,
+                // one beat per accepted wr_valid/wr_ready handshake.
                 // -----------------------------------------------------------
                 S_PREFILL_WR : begin
-                    if (wr_valid) begin
-                        // Compute write address: layer base + pos*TOKEN_STRIDE + beat
-                        wr_addr_reg <= sram_addr(cur_cmd_layer, op_pos, op_beat[$clog2(BEATS_PER_TOKEN):0]);
-                        wr_en_reg   <= 1'b1;
-
+                    if (wr_beat) begin
                         if (op_beat == BEATS_PER_TOKEN - 1) begin
                             // Finished this token's K and V
                             op_beat <= '0;
                             if (op_remaining == 1) begin
                                 // Last token of prefill
-                                seq_len_reg  <= cur_cmd_pos + cur_cmd_len;
-                                op_done      <= 1'b1;
+                                seq_len_reg  <= op_end;
                                 state        <= S_IDLE;
                             end else begin
                                 op_pos       <= op_pos + 1'b1;
@@ -425,22 +435,18 @@ module kv_cache_controller #(
 
                 // -----------------------------------------------------------
                 // DECODE APPEND
-                // Append exactly one token: write BEATS_PER_TOKEN beats at
-                // position cur_seq_len.
+                // Append exactly one token for layer op_layer: write
+                // BEATS_PER_TOKEN beats at position cur_seq_len. A decode step
+                // appends every layer at the same position, so cur_seq_len
+                // advances after the append to the last layer.
                 // -----------------------------------------------------------
                 S_DECODE_WR : begin
-                    if (wr_valid) begin
-                        // Write at the current end of the sequence
-                        wr_addr_reg <= sram_addr(cur_cmd_layer,
-                                                  seq_len_reg[$clog2(MAX_SEQ_LEN)-1:0],
-                                                  op_beat[$clog2(BEATS_PER_TOKEN):0]);
-                        wr_en_reg   <= 1'b1;
-
+                    if (wr_beat) begin
                         if (op_beat == BEATS_PER_TOKEN - 1) begin
-                            // All beats written; increment sequence length
-                            seq_len_reg <= seq_len_reg + 1'b1;
-                            op_done     <= 1'b1;
-                            state       <= S_IDLE;
+                            op_beat <= '0;
+                            if (op_layer == LAYER_BITS'(NUM_LAYERS - 1))
+                                seq_len_reg <= seq_len_reg + 1'b1;
+                            state <= S_IDLE;
                         end else begin
                             op_beat <= op_beat + 1'b1;
                         end
@@ -449,22 +455,22 @@ module kv_cache_controller #(
 
                 // -----------------------------------------------------------
                 // ATTENTION READ — Request Phase
-                // Issue read addresses one beat ahead of data needed.
-                // Read K or V (controlled by cmd_kv) for positions 0..cmd_len-1.
+                // Issue one read address per cycle: K or V (cmd_kv) for
+                // positions cmd_pos .. cmd_pos+cmd_len-1.
                 // -----------------------------------------------------------
                 S_ATTN_RD_REQ : begin
                     // Issue SRAM read for current address
-                    rd_addr_reg <= sram_addr(cur_cmd_layer, op_pos,
-                                             kv_offset + op_beat[$clog2(BEATS_PER_TOKEN):0]);
+                    rd_addr_reg <= sram_addr(op_layer, op_pos, kv_offset + op_beat);
                     rd_req_reg  <= 1'b1;
 
                     if (op_beat == BEATS_PER_KV - 1) begin
                         // Last beat for this position
                         op_beat <= '0;
                         if (op_remaining == 1) begin
-                            // Last position: set last flag (will appear on rd_valid_reg delay)
-                            op_done    <= 1'b1;
-                            state      <= S_ATTN_RD_DATA; // One more cycle for last data
+                            // Last beat of the command: flag it so rd_last
+                            // accompanies its data
+                            rd_last_req <= 1'b1;
+                            state       <= S_ATTN_RD_DATA;
                         end else begin
                             op_pos       <= op_pos + 1'b1;
                             op_remaining <= op_remaining - 1'b1;
@@ -476,14 +482,11 @@ module kv_cache_controller #(
 
                 // -----------------------------------------------------------
                 // ATTENTION READ — Final data cycle
-                // Allow the last SRAM read to propagate through the 1-cycle latency.
+                // The last request is read by the SRAM at this edge; its data
+                // (with rd_last) is on rd_data during the next cycle.
                 // -----------------------------------------------------------
                 S_ATTN_RD_DATA : begin
-                    rd_req_reg  <= 1'b0;
-                    rd_last_reg <= rd_valid_reg; // Assert rd_last when last data appears
-                    if (rd_valid_reg) begin
-                        state <= S_IDLE;
-                    end
+                    state <= S_IDLE;
                 end
 
                 default : state <= S_IDLE;
@@ -497,13 +500,19 @@ endmodule
 // =============================================================================
 // TESTBENCH
 // =============================================================================
-// Tests the three operations: PREFILL_WRITE, DECODE_APPEND, and ATTN_READ.
+// Tests the three operations: PREFILL_WRITE, DECODE_APPEND, and ATTN_READ,
+// against a reference model of the cache contents (ref_mem).
 //
 // Scenario:
-//   1. PREFILL: Write K/V for 2 tokens at layer 0.
-//   2. DECODE: Append K/V for 1 more token at layer 0.
+//   1. PREFILL: Write K/V for 2 tokens at every layer.
+//   2. DECODE: Append K/V for 1 more token at every layer (cur_seq_len must
+//      advance only after the last layer).
 //   3. ATTN_READ: Read all 3 tokens' K vectors for layer 0.
-//   4. Verify that the read data matches the written data.
+//   4. ATTN_READ: Read V vectors for layer 2, and K for layer 3 from pos 1.
+//   5. Three ATTN_READs queued back-to-back in the command FIFO.
+//   Every read beat is compared with ref_mem; beat counts and rd_last (only on
+//   the final beat of each read) are checked; the verdict counts all errors.
+// Unique data per word: layer*4096 + pos*64 + beat (beat < 64, pos < 64).
 // =============================================================================
 `ifdef SIMULATION
 module tb_kv_cache_controller;
@@ -566,7 +575,17 @@ module tb_kv_cache_controller;
     initial clk = 1'b0;
     always #(CLK_PERIOD/2) clk = ~clk;
 
-    // Task: send one command
+    // Reference model of the cache: ref_mem[layer][pos][beat within K+V block]
+    logic [DATA_WIDTH-1:0] ref_mem [NUM_LAYERS][MAX_SEQ_LEN][BEATS_PER_TOKEN];
+    int errors = 0;
+
+    function automatic logic [DATA_WIDTH-1:0] word_val(int layer, int pos, int beat);
+        return DATA_WIDTH'(layer * 4096 + pos * 64 + beat);
+    endfunction
+
+    // Task: send one command. Stimulus changes on negedge; cmd_ready is
+    // sampled at negedge (mid-cycle, stable), so the push happens on the
+    // following posedge.
     task automatic send_cmd(
         input [1:0]  t,
         input [$clog2(NUM_LAYERS)-1:0]  l,
@@ -581,28 +600,95 @@ module tb_kv_cache_controller;
         cmd_pos   = p;
         cmd_len   = n;
         cmd_kv    = kv;
-        @(posedge clk);
-        while (!cmd_ready) @(posedge clk);
+        while (cmd_ready !== 1'b1) @(negedge clk);
         @(negedge clk);
         cmd_valid = 1'b0;
     endtask
 
-    // Task: write N beats of sequential data starting from base_val
-    task automatic write_beats(input int n_beats, input int base_val);
-        for (int i = 0; i < n_beats; i++) begin
-            @(negedge clk);
-            wr_valid = 1'b1;
-            wr_data  = (base_val + i) & 16'hFFFF;
-            @(posedge clk);
-            while (!wr_ready) @(posedge clk);
+    // Task: write the K+V beats for n_tok tokens of one layer (same handshake
+    // style as send_cmd), updating the reference model
+    task automatic write_tokens(input int layer, input int pos0, input int n_tok);
+        for (int t = 0; t < n_tok; t++) begin
+            for (int b = 0; b < BEATS_PER_TOKEN; b++) begin
+                @(negedge clk);
+                wr_valid = 1'b1;
+                wr_data  = word_val(layer, pos0 + t, b);
+                ref_mem[layer][pos0 + t][b] = wr_data;
+                while (wr_ready !== 1'b1) @(negedge clk);
+            end
         end
         @(negedge clk);
         wr_valid = 1'b0;
     endtask
 
-    // Collected read data
-    int  read_buf_idx;
-    logic [DATA_WIDTH-1:0] read_buf [0:511]; // Generous buffer for collected reads
+    // Read monitor
+    logic [DATA_WIDTH-1:0] rd_q[$];
+    bit                    last_q[$];
+    always @(posedge clk) begin
+        if (rd_valid === 1'b1) begin
+            rd_q.push_back(rd_data);
+            last_q.push_back(rd_last);
+        end else if (rd_last === 1'b1) begin
+            $display("[TB] FAIL: rd_last without rd_valid");
+            errors++;
+        end
+    end
+
+    // Expected stream for one ATTN_READ
+    task automatic expect_read(input string name, input int layer, input int pos0, input int n_tok,
+                               input bit kv, inout logic [DATA_WIDTH-1:0] exp_q[$], inout bit exp_last[$]);
+        int off;
+        off = kv ? 0 : BEATS_PER_KV;
+        for (int t = 0; t < n_tok; t++)
+            for (int b = 0; b < BEATS_PER_KV; b++) begin
+                exp_q.push_back(ref_mem[layer][pos0 + t][off + b]);
+                exp_last.push_back((t == n_tok - 1) && (b == BEATS_PER_KV - 1));
+            end
+    endtask
+
+    // Wait for n beats (or time out) and compare the monitor queue with exp
+    task automatic check_reads(input string name, input logic [DATA_WIDTH-1:0] exp_q[$], input bit exp_last[$]);
+        int bad;
+        fork
+            begin : rd_timeout
+                repeat (1000) @(posedge clk);
+                disable rd_wait;
+            end
+            begin : rd_wait
+                wait (rd_q.size() >= exp_q.size());
+                disable rd_timeout;
+            end
+        join
+        repeat (4) @(posedge clk);   // catch any extra beats
+        bad = 0;
+        if (rd_q.size() != exp_q.size()) begin
+            $display("[TB] FAIL %s: %0d read beats, expected %0d", name, rd_q.size(), exp_q.size());
+            bad++;
+        end
+        for (int i = 0; i < exp_q.size() && i < rd_q.size(); i++) begin
+            if (rd_q[i] !== exp_q[i] || last_q[i] !== exp_last[i]) begin
+                if (bad < 5)
+                    $display("[TB] FAIL %s beat %0d: data 0x%04h last %0b, expected 0x%04h last %0b",
+                             name, i, rd_q[i], last_q[i], exp_q[i], exp_last[i]);
+                bad++;
+            end
+        end
+        if (bad == 0) $display("[TB] PASS %s: %0d beats match", name, exp_q.size());
+        errors += bad;
+        rd_q.delete();
+        last_q.delete();
+    endtask
+
+    task automatic check_seq_len(input string when, input int exp);
+        if (cur_seq_len !== exp) begin
+            $display("[TB] FAIL: cur_seq_len = %0d %s (expected %0d)", cur_seq_len, when, exp);
+            errors++;
+        end else
+            $display("[TB]   cur_seq_len = %0d %s", cur_seq_len, when);
+    endtask
+
+    logic [DATA_WIDTH-1:0] exp_q[$];
+    bit                    exp_last[$];
 
     // Main test
     initial begin
@@ -614,85 +700,83 @@ module tb_kv_cache_controller;
         rst_n     = 1'b0;
         cmd_valid = 1'b0;
         wr_valid  = 1'b0;
-        read_buf_idx = 0;
+        wr_data   = '0;
         repeat (4) @(posedge clk);
         rst_n = 1'b1;
         @(posedge clk);
 
         // ------------------------------------------------------------------
-        // TEST 1: PREFILL — write 2 tokens (K+V) at layer 0, starting pos 0
-        // Data: beats 0x0001..0x0040 (BEATS_PER_TOKEN*2 = 64 beats)
+        // TEST 1: PREFILL — write 2 tokens (K+V) at every layer, pos 0
         // ------------------------------------------------------------------
-        $display("[TB] Test 1: PREFILL write of 2 tokens at layer 0");
-        send_cmd(.t(2'b00), .l(0), .p(0), .n(2), .kv(1'b0));
-        write_beats(.n_beats(BEATS_PER_TOKEN * 2), .base_val(1));
-        // Wait for operation to finish (monitor cur_seq_len)
-        wait (cur_seq_len == 2);
-        $display("[TB]   cur_seq_len = %0d (expected 2)", cur_seq_len);
-        assert (cur_seq_len == 2) else $error("FAIL: expected seq_len=2");
+        $display("[TB] Test 1: PREFILL write of 2 tokens at each layer");
+        for (int l = 0; l < NUM_LAYERS; l++) begin
+            send_cmd(.t(2'b00), .l(l), .p(0), .n(2), .kv(1'b0));
+            write_tokens(l, 0, 2);
+        end
+        repeat (3) @(posedge clk);
+        check_seq_len("after prefill", 2);
 
         // ------------------------------------------------------------------
-        // TEST 2: DECODE APPEND — append 1 token at layer 0
-        // Data: beats 0x0041..0x0060 (BEATS_PER_TOKEN = 32 beats)
+        // TEST 2: DECODE APPEND — append 1 token at each layer (position 2)
         // ------------------------------------------------------------------
-        $display("[TB] Test 2: DECODE APPEND of 1 token at layer 0");
-        send_cmd(.t(2'b01), .l(0), .p(0), .n(1), .kv(1'b0));
-        write_beats(.n_beats(BEATS_PER_TOKEN), .base_val(BEATS_PER_TOKEN*2 + 1));
-        wait (cur_seq_len == 3);
-        $display("[TB]   cur_seq_len = %0d (expected 3)", cur_seq_len);
-        assert (cur_seq_len == 3) else $error("FAIL: expected seq_len=3");
+        $display("[TB] Test 2: DECODE APPEND of 1 token at each layer");
+        for (int l = 0; l < NUM_LAYERS; l++) begin
+            send_cmd(.t(2'b01), .l(l), .p(0), .n(1), .kv(1'b0));
+            write_tokens(l, 2, 1);
+            repeat (3) @(posedge clk);
+            check_seq_len($sformatf("after layer %0d append", l), (l == NUM_LAYERS - 1) ? 3 : 2);
+        end
 
         // ------------------------------------------------------------------
         // TEST 3: ATTN_READ — read K vectors for 3 tokens at layer 0
-        // Expected: BEATS_PER_KV * 3 = 48 beats of read data
-        // The K data for token 0 is beats 0x0001..0x0010 (BEATS_PER_KV=16 beats)
-        // The K data for token 1 is beats 0x0021..0x0030
-        // The K data for token 2 (appended) is beats 0x0041..0x0050
         // ------------------------------------------------------------------
         $display("[TB] Test 3: ATTN_READ of K vectors, 3 tokens at layer 0");
+        exp_q.delete(); exp_last.delete();
+        expect_read("T3", 0, 0, 3, 1'b1, exp_q, exp_last);
         send_cmd(.t(2'b10), .l(0), .p(0), .n(3), .kv(1'b1)); // kv=1: read K
+        check_reads("Test 3 (L0 K x3)", exp_q, exp_last);
 
-        // Wait for rd_last
-        fork
-            begin : t3_timeout
-                repeat (500) @(posedge clk);
-                $display("[TB] TIMEOUT in ATTN_READ");
-                disable t3_wait;
-            end
-            begin : t3_wait
-                wait (rd_last);
-                disable t3_timeout;
-            end
-        join
+        // ------------------------------------------------------------------
+        // TEST 4: ATTN_READ — V of layer 2, then K of layer 3 from pos 1
+        // ------------------------------------------------------------------
+        $display("[TB] Test 4: ATTN_READ of V (layer 2) and K from pos 1 (layer 3)");
+        exp_q.delete(); exp_last.delete();
+        expect_read("T4a", 2, 0, 3, 1'b0, exp_q, exp_last);
+        send_cmd(.t(2'b10), .l(2), .p(0), .n(3), .kv(1'b0)); // kv=0: read V
+        check_reads("Test 4a (L2 V x3)", exp_q, exp_last);
+        exp_q.delete(); exp_last.delete();
+        expect_read("T4b", 3, 1, 2, 1'b1, exp_q, exp_last);
+        send_cmd(.t(2'b10), .l(3), .p(1), .n(2), .kv(1'b1));
+        check_reads("Test 4b (L3 K pos1 x2)", exp_q, exp_last);
 
-        // Report
-        $display("[TB]   Received %0d read beats (expected %0d)",
-                 read_buf_idx, BEATS_PER_KV * 3);
+        // ------------------------------------------------------------------
+        // TEST 5: three reads queued back-to-back in the command FIFO
+        // ------------------------------------------------------------------
+        $display("[TB] Test 5: three queued ATTN_READs");
+        exp_q.delete(); exp_last.delete();
+        expect_read("T5a", 1, 0, 3, 1'b1, exp_q, exp_last);
+        expect_read("T5b", 1, 0, 3, 1'b0, exp_q, exp_last);
+        expect_read("T5c", 0, 2, 1, 1'b0, exp_q, exp_last);
+        send_cmd(.t(2'b10), .l(1), .p(0), .n(3), .kv(1'b1));
+        send_cmd(.t(2'b10), .l(1), .p(0), .n(3), .kv(1'b0));
+        send_cmd(.t(2'b10), .l(0), .p(2), .n(1), .kv(1'b0));
+        check_reads("Test 5 (queued reads)", exp_q, exp_last);
 
-        // Spot-check: first K beat of token 0 should be 0x0001
-        $display("[TB]   First read beat = 0x%04h (expected 0x0001)", read_buf[0]);
-        if (read_buf[0] == 16'h0001)
-            $display("[TB] PASS: First K beat correct");
-        else
-            $display("[TB] FAIL: First K beat = 0x%04h, expected 0x0001", read_buf[0]);
-
-        $display("[TB] All tests complete. cur_seq_len=%0d, cache_full=%0b",
-                 cur_seq_len, cache_full);
-        $finish;
-    end
-
-    // Collect read data
-    always_ff @(posedge clk) begin
-        if (rd_valid) begin
-            read_buf[read_buf_idx] <= rd_data;
-            read_buf_idx++;
+        check_seq_len("at end", 3);
+        if (cache_full !== 1'b0) begin
+            $display("[TB] FAIL: cache_full set at seq_len 3");
+            errors++;
         end
+
+        if (errors == 0) $display("[TB] ALL TESTS PASSED");
+        else             $display("[TB] FAIL: %0d error(s)", errors);
+        $finish;
     end
 
     // Global timeout
     initial begin
         #200000;
-        $display("[TB] Global simulation timeout");
+        $display("[TB] FAIL: Global simulation timeout");
         $finish;
     end
 

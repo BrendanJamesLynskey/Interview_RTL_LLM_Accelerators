@@ -118,41 +118,78 @@ module double_buffer_controller #(
     // -------------------------------------------------------------------------
     // State machine
     // -------------------------------------------------------------------------
-    // The pipeline has two phases per slot:
-    //   PHASE_FILL    : Waiting for DMA to fill the inactive bank (startup)
-    //   PHASE_OVERLAP : Both compute and DMA running concurrently
-    //   PHASE_DRAIN   : Last tile computing, no DMA pending
+    // The protocol is tracked per bank rather than with one state per overlap
+    // case: the FSM only says whether a job is running, and the start
+    // decisions below follow from which bank is full / being filled / being
+    // computed. With two banks this gives exactly the PROTOCOL above:
+    //   - DMA fills banks 0,1,0,1,... ; compute reads banks 0,1,0,1,...
+    //   - the next DMA starts when the DMA engine is free AND its bank is empty
+    //     (its previous tile has been computed) -> "both done" in step 3
+    //   - the next compute starts when the compute unit is free AND its bank
+    //     has been filled.
+    // Starts are issued in the same cycle as the done pulse that enables them.
     //
-    typedef enum logic [2:0] {
-        S_IDLE        = 3'd0,
-        S_FIRST_FILL  = 3'd1,   // Waiting for first DMA to complete (no compute yet)
-        S_OVERLAP     = 3'd2,   // Compute and DMA both in flight
-        S_WAIT_DMA    = 3'd3,   // Compute done, waiting for DMA to finish
-        S_WAIT_COMP   = 3'd4,   // DMA done, waiting for compute to finish
-        S_DRAIN       = 3'd5,   // Last tile in compute, no more DMA
-        S_DONE        = 3'd6
+    typedef enum logic [1:0] {
+        S_IDLE        = 2'd0,
+        S_RUN         = 2'd1,   // DMA and/or compute in flight
+        S_DONE        = 2'd2    // One cycle: all_done
     } state_t;
 
-    state_t state, next_state;
+    state_t state;
 
     // -------------------------------------------------------------------------
     // Internal registers
     // -------------------------------------------------------------------------
-    logic       active_bank;          // Which bank is currently being computed
-    logic [15:0] tiles_issued;        // Number of DMA requests issued (not computed)
+    logic [15:0] n_tiles;             // num_tiles latched at start
+    logic [15:0] tiles_issued;        // Number of DMA requests issued
+    logic [15:0] comp_issued;         // Number of compute requests issued
     logic [15:0] tiles_computed;      // Number of tiles compute has finished
 
-    logic       compute_pending;      // Compute has started but not yet done
-    logic       dma_pending;          // DMA has started but not yet done
+    logic       fill_bank;            // Bank the next DMA writes
+    logic       comp_bank;            // Bank the next compute reads
+    logic       dma_busy, dma_cur;    // DMA in flight, and the bank it is filling
+    logic       comp_busy, comp_cur;  // Compute in flight, and the bank it is reading
+    logic [1:0] bank_full;            // Bank holds a loaded tile not yet computed
 
-    // Derived signals
-    logic       more_tiles_to_dma;    // There are still tiles to fetch
-    logic       last_compute;         // Current compute tile is the last one
+    // "Effective" view for this cycle: registered state updated with this
+    // cycle's done pulses, so a start can be issued in the same cycle as the
+    // done that allows it
+    logic       dma_busy_eff, comp_busy_eff;
+    logic [1:0] full_eff;
+    logic [15:0] computed_eff;
 
     always_comb begin
-        more_tiles_to_dma = (tiles_issued < num_tiles);
-        last_compute      = (tiles_computed == num_tiles - 1);
+        dma_busy_eff  = dma_busy  && !dma_done;
+        comp_busy_eff = comp_busy && !compute_done;
+        for (int b = 0; b < 2; b++)
+            full_eff[b] = (bank_full[b] || (dma_busy && dma_done && dma_cur == b))
+                          && !(comp_busy && compute_done && comp_cur == b);
+        computed_eff  = tiles_computed + ((comp_busy && compute_done) ? 16'd1 : 16'd0);
     end
+
+    // -------------------------------------------------------------------------
+    // Start decisions
+    // -------------------------------------------------------------------------
+    always_comb begin
+        dma_start     = 1'b0;
+        compute_start = 1'b0;
+        if (state == S_IDLE) begin
+            // Tile 0 into bank 0 as soon as the job starts
+            dma_start = start && (num_tiles >= 1);
+        end else if (state == S_RUN) begin
+            // (With in-order ping-pong either bank condition alone is enough --
+            //  a full fill bank is always the one being computed -- but both
+            //  are kept so the safety rule reads directly off the code.)
+            dma_start     = !dma_busy_eff && (tiles_issued < n_tiles) &&
+                            !full_eff[fill_bank] && !(comp_busy_eff && comp_cur == fill_bank);
+            compute_start = !comp_busy_eff && (comp_issued < n_tiles) && full_eff[comp_bank];
+        end
+    end
+
+    // Bank selects, valid in the cycle of the corresponding start pulse (the
+    // DMA engine / compute unit registers them together with the start)
+    assign dma_bank_sel     = (state == S_IDLE) ? 1'b0 : fill_bank;
+    assign compute_bank_sel = comp_bank;
 
     // -------------------------------------------------------------------------
     // Sequential state and register updates
@@ -160,185 +197,74 @@ module double_buffer_controller #(
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             state          <= S_IDLE;
-            active_bank    <= 1'b0;
+            n_tiles        <= '0;
             tiles_issued   <= '0;
+            comp_issued    <= '0;
             tiles_computed <= '0;
-            compute_pending<= 1'b0;
-            dma_pending    <= 1'b0;
+            fill_bank      <= 1'b0;
+            comp_bank      <= 1'b0;
+            dma_busy       <= 1'b0;
+            dma_cur        <= 1'b0;
+            comp_busy      <= 1'b0;
+            comp_cur       <= 1'b0;
+            bank_full      <= '0;
         end else begin
-            state <= next_state;
+            case (state)
+                S_IDLE: begin
+                    if (start) begin
+                        // New job: tile 0 is issued to bank 0 this cycle
+                        n_tiles        <= num_tiles;
+                        tiles_issued   <= (num_tiles >= 1) ? 16'd1 : 16'd0;
+                        comp_issued    <= '0;
+                        tiles_computed <= '0;
+                        fill_bank      <= 1'b1;
+                        comp_bank      <= 1'b0;
+                        dma_busy       <= (num_tiles >= 1);
+                        dma_cur        <= 1'b0;
+                        comp_busy      <= 1'b0;
+                        bank_full      <= '0;
+                        state          <= (num_tiles >= 1) ? S_RUN : S_DONE;
+                    end
+                end
 
-            // Track DMA issues and completions
-            if (dma_start)
-                tiles_issued <= tiles_issued + 1'b1;
+                S_RUN: begin
+                    bank_full      <= full_eff;
+                    dma_busy       <= dma_busy_eff;
+                    comp_busy      <= comp_busy_eff;
+                    tiles_computed <= computed_eff;
+                    if (dma_start) begin
+                        dma_busy     <= 1'b1;
+                        dma_cur      <= fill_bank;
+                        fill_bank    <= ~fill_bank;
+                        tiles_issued <= tiles_issued + 1'b1;
+                    end
+                    if (compute_start) begin
+                        comp_busy   <= 1'b1;
+                        comp_cur    <= comp_bank;
+                        comp_bank   <= ~comp_bank;
+                        comp_issued <= comp_issued + 1'b1;
+                    end
+                    if (computed_eff == n_tiles)
+                        state <= S_DONE;            // Last compute tile finished
+                end
 
-            // Track compute completions
-            if (compute_done)
-                tiles_computed <= tiles_computed + 1'b1;
+                S_DONE: begin
+                    state <= S_IDLE;                // Auto-return to idle after 1 cycle
+                end
 
-            // Bank swap on overlap resolution
-            if ((state == S_OVERLAP  && compute_done && dma_done) ||
-                (state == S_WAIT_DMA && dma_done)                 ||
-                (state == S_WAIT_COMP && compute_done))
-                active_bank <= ~active_bank;
-
-            // Reset on start
-            if (start && state == S_IDLE) begin
-                tiles_issued   <= '0;
-                tiles_computed <= '0;
-                active_bank    <= 1'b0;
-            end
+                default: state <= S_IDLE;
+            endcase
         end
     end
 
-    // -------------------------------------------------------------------------
-    // Next-state logic
-    // -------------------------------------------------------------------------
-    always_comb begin
-        next_state = state;
-
-        unique case (state)
-            S_IDLE: begin
-                if (start)
-                    next_state = S_FIRST_FILL;  // Issue DMA for tile 0
-            end
-
-            S_FIRST_FILL: begin
-                // Waiting for first DMA; no compute yet
-                if (dma_done) begin
-                    if (num_tiles == 1)
-                        next_state = S_DRAIN;   // Only one tile: no overlap possible
-                    else
-                        next_state = S_OVERLAP; // Start compute + prefetch tile 1
-                end
-            end
-
-            S_OVERLAP: begin
-                // Both compute and DMA in flight
-                if (compute_done && dma_done) begin
-                    // Both finished simultaneously
-                    if (!more_tiles_to_dma || tiles_computed + 1 == num_tiles - 1)
-                        // After swap, next compute is the last tile
-                        next_state = (more_tiles_to_dma) ? S_DRAIN : S_DONE;
-                    else
-                        next_state = S_OVERLAP; // Both restart immediately
-                end else if (compute_done) begin
-                    next_state = S_WAIT_DMA;    // Stall: waiting for DMA
-                end else if (dma_done) begin
-                    next_state = S_WAIT_COMP;   // DMA early: wait for compute
-                end
-            end
-
-            S_WAIT_DMA: begin
-                // Compute done, DMA still running -- stalling
-                if (dma_done) begin
-                    if (tiles_computed + 1 >= num_tiles)
-                        next_state = S_DONE;    // No more tiles to compute after swap
-                    else if (!more_tiles_to_dma)
-                        next_state = S_DRAIN;
-                    else
-                        next_state = S_OVERLAP;
-                end
-            end
-
-            S_WAIT_COMP: begin
-                // DMA done early, compute still running
-                if (compute_done) begin
-                    if (!more_tiles_to_dma)
-                        next_state = S_DRAIN;
-                    else
-                        next_state = S_OVERLAP;
-                end
-            end
-
-            S_DRAIN: begin
-                // Last tile in compute, no DMA pending
-                if (compute_done)
-                    next_state = S_DONE;
-            end
-
-            S_DONE: begin
-                next_state = S_IDLE;            // Auto-return to idle after 1 cycle
-            end
-
-            default: next_state = S_IDLE;
-        endcase
-    end
-
-    // -------------------------------------------------------------------------
-    // Output logic
-    // -------------------------------------------------------------------------
-
-    // dma_start: pulse when transitioning from IDLE->FIRST_FILL (tile 0),
-    //            and when a bank swap occurs and more tiles remain.
-    always_comb begin
-        dma_start = 1'b0;
-
-        case (state)
-            S_IDLE: dma_start = start && (num_tiles >= 1);
-
-            // After first DMA lands, immediately start DMA for tile 1
-            S_FIRST_FILL: dma_start = dma_done && more_tiles_to_dma && (num_tiles > 1);
-
-            // After a successful overlap resolution, issue next DMA
-            S_OVERLAP: begin
-                dma_start = dma_done && more_tiles_to_dma;
-            end
-
-            S_WAIT_DMA: dma_start = dma_done && more_tiles_to_dma;
-            S_WAIT_COMP: dma_start = 1'b0;  // DMA already done, compute catching up
-
-            default: dma_start = 1'b0;
-        endcase
-    end
-
-    // DMA bank: always the INACTIVE bank (opposite of active)
-    assign dma_bank_sel = ~active_bank;
-
-    // compute_start: pulse when a new tile is ready to be computed
-    always_comb begin
-        compute_start = 1'b0;
-
-        case (state)
-            // First compute starts when first DMA completes
-            S_FIRST_FILL: compute_start = dma_done;
-
-            // After overlap, if both just finished, start next compute immediately
-            S_OVERLAP: compute_start = dma_done && compute_done;
-
-            // DMA just finished while compute was stalling us
-            S_WAIT_DMA: compute_start = dma_done;
-
-            // Compute finished, DMA was already done -- start compute on next bank
-            S_WAIT_COMP: compute_start = compute_done;
-
-            default: compute_start = 1'b0;
-        endcase
-    end
-
-    // Compute bank: always the ACTIVE bank (but after swap, active_bank already flipped)
-    // compute_start is asserted on the same cycle as the swap, so we use the post-swap value.
-    // Since active_bank updates in the FF on the same edge, compute_start should use the
-    // next-cycle value. We hold compute_bank_sel as the registered active bank, which will
-    // be correct by the cycle after compute_start is issued.
-    //
-    // Simpler model: compute_start is a "go" signal; compute_bank_sel tells compute which
-    // bank to use. We present the CURRENT active_bank (before swap) alongside compute_start.
-    // The bank swap happens on the same clock edge as compute_start, so the compute unit
-    // should register compute_bank_sel when compute_start is asserted.
-    always_comb begin
-        if (state == S_FIRST_FILL && dma_done)
-            compute_bank_sel = active_bank;  // First tile: active bank hasn't swapped yet
-        else
-            compute_bank_sel = ~active_bank; // After swap, the new active bank is ~old active
-    end
-
     // Status
-    assign busy       = (state != S_IDLE && state != S_DONE);
+    assign busy       = (state == S_RUN);
     assign all_done   = (state == S_DONE);
 
     // -------------------------------------------------------------------------
     // Stall cycle counter
+    // A stall cycle: compute unit idle (after its first tile) with tiles left
+    // to compute, but the next bank is not yet filled -- waiting on the DMA.
     // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -346,7 +272,8 @@ module double_buffer_controller #(
         end else begin
             if (start && state == S_IDLE)
                 stall_cycles <= '0;                    // Reset on new job
-            else if (state == S_WAIT_DMA)
+            else if (state == S_RUN && !comp_busy_eff && computed_eff != 0 &&
+                     comp_issued < n_tiles && !compute_start)
                 stall_cycles <= stall_cycles + 1'b1;   // Saturating not needed; wraps OK
         end
     end
@@ -366,10 +293,10 @@ module double_buffer_controller #(
         busy |-> (dma_bank_sel !== 1'bx && compute_bank_sel !== 1'bx))
         else $error("Bank select is X during busy");
 
-    // dma_start must not be asserted in DRAIN or DONE (no tiles to prefetch)
+    // No more than num_tiles DMA transfers per job
     assert property (@(posedge clk) disable iff (!rst_n)
-        (state == S_DRAIN || state == S_DONE) |-> !dma_start)
-        else $error("DMA started in DRAIN/DONE state");
+        (state == S_RUN && dma_start) |-> (tiles_issued < n_tiles))
+        else $error("DMA started with no tiles left to fetch");
 
     // synthesis translate_on
 
@@ -395,81 +322,158 @@ module tb_double_buffer_controller;
     initial clk = 0;
     always #5 clk = ~clk;
 
-    // Simple DMA and compute models
-    // dma_delay and compute_delay can be varied to test different overlap scenarios
+    // -------------------------------------------------------------------------
+    // DMA and compute models (cycle based, sampled on posedge, driven with
+    // NBAs so the DUT sees them race-free). A request seen at edge E completes
+    // with a one-cycle done pulse sampled at edge E + delay.
+    // The models move real tile ids through the two banks:
+    //   DMA writes tile t into bank_mem[bank] when it completes;
+    //   compute checks it reads tile 0,1,2,... in order from the bank it was
+    //   given, and that no DMA ever targets a bank still holding an
+    //   uncomputed tile or being computed.
+    // -------------------------------------------------------------------------
+    int  dma_delay, comp_delay;        // fixed delays (cycles, >= 1)
+    bit  rand_delay;                   // per-tile random delays 1..12 instead
+    int  bank_mem [2];                 // tile id held by each bank (-1 = empty)
+    int  dma_rem,  comp_rem;
+    bit  dma_act,  comp_act;
+    int  dma_b,    comp_b;
+    int  dma_tile, comp_tile;          // next tile id for DMA / expected by compute
+    int  computed, n_dma, n_comp, n_done, stalls_seen, errors;
+    bit  running;
+    longint t_start, t_last;           // edge counts
+    longint edge_no;
+
+    always @(posedge clk) begin
+        edge_no++;
+        dma_done     <= 1'b0;
+        compute_done <= 1'b0;
+
+        // ---- stall observation (compute ready but next tile not loaded) ----
+        if (running && !comp_act && computed > 0 && n_comp < num_tiles && !compute_start)
+            stalls_seen++;
+
+        // ---- DMA model ----
+        if (dma_start) begin
+            n_dma++;
+            if (dma_act) begin
+                $display("  ERROR: dma_start while a DMA is in flight"); errors++;
+            end
+            if (bank_mem[dma_bank_sel] != -1) begin
+                $display("  ERROR: DMA into bank %0b which still holds uncomputed tile %0d",
+                         dma_bank_sel, bank_mem[dma_bank_sel]); errors++;
+            end
+            if (comp_act && comp_b == dma_bank_sel) begin
+                $display("  ERROR: DMA into bank %0b while it is being computed", dma_bank_sel); errors++;
+            end
+            dma_act = 1; dma_b = dma_bank_sel;
+            dma_rem = (rand_delay ? $urandom_range(12, 1) : dma_delay) - 1;
+        end else if (dma_act)
+            dma_rem--;
+        if (dma_act && dma_rem == 0) begin
+            dma_done <= 1'b1;
+            dma_act   = 0;
+            bank_mem[dma_b] = dma_tile++;
+        end
+
+        // ---- compute model ----
+        if (compute_start) begin
+            n_comp++;
+            if (comp_act) begin
+                $display("  ERROR: compute_start while compute is busy"); errors++;
+            end
+            if (bank_mem[compute_bank_sel] != comp_tile) begin
+                $display("  ERROR: compute %0d reads bank %0b holding tile %0d (expected tile %0d)",
+                         n_comp - 1, compute_bank_sel, bank_mem[compute_bank_sel], comp_tile); errors++;
+            end
+            comp_act = 1; comp_b = compute_bank_sel; comp_tile++;
+            comp_rem = (rand_delay ? $urandom_range(12, 1) : comp_delay) - 1;
+        end else if (comp_act)
+            comp_rem--;
+        if (comp_act && comp_rem == 0) begin
+            compute_done <= 1'b1;
+            comp_act = 0;
+            bank_mem[comp_b] = -1;          // tile consumed, bank free
+            computed++;
+            t_last = edge_no + 1;           // done is sampled at the next edge
+        end
+
+        if (all_done) n_done++;
+    end
 
     task automatic run_test(
         input int n_tiles,
         input int dma_delay_cycles,   // cycles DMA takes per tile after dma_start
         input int comp_delay_cycles,  // cycles compute takes per tile after compute_start
+        input bit random,             // random 1..12 delays per tile instead
         input string test_name
     );
-        int tiles_checked;
-        int start_cycle;
-        int expected_stalls;
+        longint t_exp, stall_exp;
+        int     slow;
 
-        $display("=== %s: %0d tiles, DMA=%0d cycles, Compute=%0d cycles ===",
-                 test_name, n_tiles, dma_delay_cycles, comp_delay_cycles);
+        $display("=== %s: %0d tiles, DMA=%0d cycles, Compute=%0d cycles%s ===",
+                 test_name, n_tiles, dma_delay_cycles, comp_delay_cycles,
+                 random ? " (random 1..12)" : "");
 
-        @(posedge clk);
+        dma_delay  = dma_delay_cycles;
+        comp_delay = comp_delay_cycles;
+        rand_delay = random;
+        bank_mem   = '{-1, -1};
+        dma_tile = 0; comp_tile = 0; computed = 0;
+        n_dma = 0; n_comp = 0; n_done = 0; stalls_seen = 0;
+
+        @(negedge clk);
         num_tiles = n_tiles;
         start = 1;
-        @(posedge clk);
+        running = 1;
+        t_start = edge_no + 1;              // start is sampled at the next edge
+        @(negedge clk);
         start = 0;
-        start_cycle = $time;
 
-        // Drive DMA done responses
         fork
-            // DMA model: respond to dma_start after dma_delay_cycles
-            begin : dma_model
-                int issued = 0;
-                while (issued < n_tiles) begin
-                    @(posedge clk iff dma_start);
-                    issued++;
-                    repeat(dma_delay_cycles - 1) @(posedge clk);
-                    dma_done = 1;
-                    @(posedge clk);
-                    dma_done = 0;
-                end
+            begin : wait_done
+                wait (n_done > 0);
             end
-
-            // Compute model: respond to compute_start after comp_delay_cycles
-            begin : compute_model
-                int computed = 0;
-                while (computed < n_tiles) begin
-                    @(posedge clk iff compute_start);
-                    computed++;
-                    repeat(comp_delay_cycles - 1) @(posedge clk);
-                    compute_done = 1;
-                    @(posedge clk);
-                    compute_done = 0;
-                end
-            end
-
-            // Timeout watchdog
             begin : watchdog
                 repeat(10000) @(posedge clk);
-                $fatal(1, "Test '%s' timed out", test_name);
+                $display("  ERROR: Test '%s' timed out", test_name);
+                errors++;
             end
         join_any
-        disable dma_model;
-        disable compute_model;
+        disable wait_done;
         disable watchdog;
+        running = 0;
+        repeat (3) @(negedge clk);          // all_done must not repeat
 
-        @(posedge all_done);
-        @(posedge clk);  // Observe done for one cycle
-
-        $display("  Completed. Stall cycles = %0d", stall_cycles);
-        if (dma_delay_cycles > comp_delay_cycles)
-            $display("  Expected stalls (DMA-bound): %0d stalls per tile",
-                     dma_delay_cycles - comp_delay_cycles);
-        else
-            $display("  No stalls expected (compute-bound or balanced)");
-
-        // Verify not still busy
-        assert (!busy) else $error("Controller still busy after all_done");
-        @(posedge clk);
-
+        $display("  Completed in %0d cycles. Stall cycles = %0d (observed %0d)",
+                 t_last - t_start, stall_cycles, stalls_seen);
+        if (n_dma != n_tiles || n_comp != n_tiles || computed != n_tiles || n_done != 1) begin
+            $display("  ERROR: %0d DMAs, %0d computes started, %0d computed, %0d all_done cycles (expected %0d, %0d, %0d, 1)",
+                     n_dma, n_comp, computed, n_done, n_tiles, n_tiles, n_tiles);
+            errors++;
+        end
+        if (stall_cycles != stalls_seen) begin
+            $display("  ERROR: stall_cycles = %0d, observed %0d", stall_cycles, stalls_seen);
+            errors++;
+        end
+        if (!random) begin
+            // Ideal double-buffered schedule: tile 0 load, then n-1 steps of the
+            // slower engine, then the last compute. Each compute after the first
+            // waits max(0, D-C) cycles for its data.
+            slow      = (dma_delay_cycles > comp_delay_cycles) ? dma_delay_cycles : comp_delay_cycles;
+            t_exp     = dma_delay_cycles + (n_tiles - 1) * slow + comp_delay_cycles;
+            stall_exp = (dma_delay_cycles > comp_delay_cycles) ?
+                        (n_tiles - 1) * (dma_delay_cycles - comp_delay_cycles) : 0;
+            if (t_last - t_start != t_exp || stall_cycles != stall_exp) begin
+                $display("  ERROR: %0d cycles / %0d stalls, expected %0d / %0d (full overlap)",
+                         t_last - t_start, stall_cycles, t_exp, stall_exp);
+                errors++;
+            end
+        end
+        if (busy) begin
+            $display("  ERROR: Controller still busy after all_done");
+            errors++;
+        end
     endtask
 
     initial begin
@@ -478,42 +482,40 @@ module tb_double_buffer_controller;
         num_tiles   = 0;
         dma_done    = 0;
         compute_done= 0;
+        errors      = 0;
+        running     = 0;
+        edge_no     = 0;
+        dma_act     = 0;
+        comp_act    = 0;
 
-        repeat(4) @(posedge clk);
+        repeat(4) @(negedge clk);
         rst_n = 1;
-        @(posedge clk);
+        @(negedge clk);
 
         // Test 1: Single tile (no overlap possible)
-        run_test(1, 4, 4, "Single tile");
+        run_test(1, 4, 4, 0, "Single tile");
 
-        // Test 2: Balanced (DMA == compute) - no stalls expected
-        run_test(8, 10, 10, "Balanced DMA==Compute");
+        // Test 2: Two tiles
+        run_test(2, 3, 6, 0, "Two tiles");
 
-        // Test 3: Compute-bound (compute slower than DMA) - no stalls expected
-        run_test(6, 5, 15, "Compute-bound (DMA fast)");
+        // Test 3: Balanced (DMA == compute) - no stalls expected
+        run_test(8, 10, 10, 0, "Balanced DMA==Compute");
 
-        // Test 4: DMA-bound (DMA slower than compute) - stalls expected
-        run_test(6, 15, 5, "DMA-bound (stalls expected)");
+        // Test 4: Compute-bound (compute slower than DMA) - no stalls expected
+        run_test(6, 5, 15, 0, "Compute-bound (DMA fast)");
 
-        // Test 5: Large tile count
-        run_test(32, 8, 8, "32 tiles balanced");
+        // Test 5: DMA-bound (DMA slower than compute) - stalls expected
+        run_test(6, 15, 5, 0, "DMA-bound (stalls expected)");
 
-        $display("ALL TESTS PASSED");
+        // Test 6: Large tile count, single-cycle engines
+        run_test(32, 1, 1, 0, "32 tiles, 1-cycle DMA and compute");
+
+        // Test 7: Random per-tile delays
+        run_test(40, 0, 0, 1, "Random delays");
+
+        if (errors == 0) $display("ALL TESTS PASSED");
+        else             $display("TESTS FAILED: %0d error(s)", errors);
         $finish;
-    end
-
-    // Monitor: display key transitions
-    always @(posedge clk) begin
-        if (dma_start)
-            $display("  t=%0t DMA_START -> bank %0b", $time, dma_bank_sel);
-        if (dma_done)
-            $display("  t=%0t DMA_DONE", $time);
-        if (compute_start)
-            $display("  t=%0t COMPUTE_START <- bank %0b", $time, compute_bank_sel);
-        if (compute_done)
-            $display("  t=%0t COMPUTE_DONE", $time);
-        if (all_done)
-            $display("  t=%0t ALL_DONE (stalls=%0d)", $time, stall_cycles);
     end
 
     initial #500000 $fatal(1, "Global simulation timeout");

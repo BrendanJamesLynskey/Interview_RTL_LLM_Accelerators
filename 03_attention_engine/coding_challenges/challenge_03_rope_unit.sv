@@ -46,10 +46,14 @@
 //
 // PIPELINE STAGES (per batch of PAIR_ENGINES pairs)
 // --------------------------------------------------
-//   Stage 1: Register inputs from vector register file and sin/cos LUT row buffer.
-//   Stage 2: Four parallel multiplies per cell: q_e*cos, q_o*sin, q_e*sin, q_o*cos.
-//   Stage 3: Subtract/Add to form the two output values.
-//   Stage 4: Arithmetic right shift by 14, saturate to INT16, write to output reg file.
+//   Cycle 1 (combinational, then registered in pipe_q_*): read the vector banks
+//            and sin/cos row buffer, four multiplies per cell (q_e*cos, q_o*sin,
+//            q_e*sin, q_o*cos), subtract/add, arithmetic right shift by 14
+//            (truncating), saturate to INT16.
+//   Cycle 2: write the registered batch into the output register file.
+// One batch enters per cycle, so a rotation takes CYCLES_PER_ROTATE + 1 cycles
+// of busy; done pulses the cycle after the last batch has been written.
+// A deeper pipeline would split cycle 1 at the multipliers for timing.
 //
 // PARAMETERS
 // ----------
@@ -216,7 +220,7 @@ module rope_unit #(
     reg signed [15:0] q_bank_even [0:NUM_PAIRS-1]; // q[0], q[2], ..., q[HEAD_DIM-2]
     reg signed [15:0] q_bank_odd  [0:NUM_PAIRS-1]; // q[1], q[3], ..., q[HEAD_DIM-1]
 
-    // Load from sequential interface
+    // Load from sequential interface (the caller must not load while busy)
     always_ff @(posedge clk) begin
         if (vec_load_valid) begin
             if (!vec_load_idx[0]) // Even index
@@ -302,8 +306,11 @@ module rope_unit #(
     state_t ctrl_state;
     reg [$clog2(CYCLES_PER_ROTATE):0] cycle_count; // Counts 0..CYCLES_PER_ROTATE-1
 
+    // done is registered: it rises the cycle after FLUSH, i.e. once the last
+    // batch has been written into the output banks and can be read
+    reg done_reg;
     assign busy = (ctrl_state != S_IDLE);
-    assign done = (ctrl_state == S_FLUSH) && pipe_valid;
+    assign done = done_reg;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -311,8 +318,10 @@ module rope_unit #(
             pair_base   <= '0;
             cycle_count <= '0;
             pipe_valid  <= 1'b0;
+            done_reg    <= 1'b0;
         end else begin
             pipe_valid <= 1'b0; // Default: no valid pipeline output
+            done_reg   <= (ctrl_state == S_FLUSH);
 
             case (ctrl_state)
                 // ---------------------------------------------------------
@@ -395,6 +404,12 @@ endmodule
 //
 //   Verification: out[i] == in[i] for all i.
 //
+// Every test compares all HEAD_DIM outputs with a bit-exact integer model of
+// the datapath and with the ideal real-arithmetic rotation (tolerance derived
+// in check_rotation); Test 4 uses real RoPE angles pos * 10000^(-2i/d) at
+// several positions and Test 5 checks output saturation. done is checked to be
+// a one-cycle pulse after which the whole result is readable.
+//
 // Extended test: position=1 with theta_0=pi/4 (pair 0 angle = pi/4):
 //   q[0] = 1.0, q[1] = 0.0
 //   cos(pi/4) = sin(pi/4) = 1/sqrt(2) ≈ 0.7071 -> Q1.14 = 11585
@@ -452,6 +467,15 @@ module tb_rope_unit;
         .out_data       (out_data)
     );
 
+    // Values actually loaded into the DUT (after Q1.14 conversion), the
+    // output read back, and the last element as read in the done cycle
+    logic signed [15:0] q_int   [0:HEAD_DIM-1];
+    logic signed [15:0] sin_int [0:NUM_PAIRS-1];
+    logic signed [15:0] cos_int [0:NUM_PAIRS-1];
+    logic signed [15:0] out_int [0:HEAD_DIM-1];
+    logic signed [15:0] last_at_done;
+    int errors = 0;
+
     // Clock generation
     initial clk = 1'b0;
     always #(CLK_PERIOD/2) clk = ~clk;
@@ -486,10 +510,8 @@ module tb_rope_unit;
             lut_load_idx   <= i[$clog2(NUM_PAIRS)-1:0];
             lut_load_sin   <= to_q1_14($sin(angles[i]));
             lut_load_cos   <= to_q1_14($cos(angles[i]));
-            $display("[TB] LUT[%0d]: angle=%.4f, sin=%h (%.4f), cos=%h (%.4f)",
-                     i, angles[i],
-                     to_q1_14($sin(angles[i])), $sin(angles[i]),
-                     to_q1_14($cos(angles[i])), $cos(angles[i]));
+            sin_int[i]      = to_q1_14($sin(angles[i]));
+            cos_int[i]      = to_q1_14($cos(angles[i]));
             @(posedge clk);
         end
         @(negedge clk);
@@ -503,6 +525,7 @@ module tb_rope_unit;
             vec_load_valid <= 1'b1;
             vec_load_idx   <= i[$clog2(HEAD_DIM)-1:0];
             vec_load_data  <= to_q1_14(vec[i]);
+            q_int[i]        = to_q1_14(vec[i]);
             @(posedge clk);
         end
         @(negedge clk);
@@ -520,15 +543,26 @@ module tb_rope_unit;
         fork
             begin : to_blk
                 repeat(200) @(posedge clk);
-                $display("[TB] TIMEOUT waiting for done");
+                $display("[TB] FAIL: TIMEOUT waiting for done");
+                errors++;
                 disable w_blk;
             end
             begin : w_blk
                 wait(done);
                 disable to_blk;
+                // The whole result must already be readable while done is high
+                out_idx = HEAD_DIM - 1;
+                #1 last_at_done = out_data;
             end
         join
-        @(posedge clk); // Let output settle
+        // done must be a one-cycle pulse, and the output banks are
+        // complete from the cycle done is seen (read_output starts later)
+        @(posedge clk);
+        #1;
+        if (done !== 1'b0) begin
+            $display("[TB]   FAIL: done high for more than one cycle");
+            errors++;
+        end
     endtask
 
     // Task: read and display output vector
@@ -539,7 +573,65 @@ module tb_rope_unit;
             @(posedge clk);
             // out_data is combinatorial from out_idx, available same cycle
             out_vec[i] = from_q1_14(out_data);
+            out_int[i] = out_data;
         end
+    endtask
+
+    // -----------------------------------------------------------------------
+    // Reference model and checking
+    // -----------------------------------------------------------------------
+    // Bit-exact model of rotation_cell: 64-bit products and sums, arithmetic
+    // shift right by 14 (floor), saturate to INT16
+    function automatic logic signed [15:0] sat_shift(input longint v);
+        longint s;
+        s = v >>> 14;
+        if (s >  32767) return 16'sd32767;
+        if (s < -32768) return -16'sd32768;
+        return 16'(s);
+    endfunction
+
+    // Compare every output element with (a) the bit-exact model and (b) the
+    // real-arithmetic rotation of the loaded input by the ideal angle.
+    // (b) tolerance: sin/cos are truncated to Q1.14 (error < 2^-14 each), so
+    // with |q_e|,|q_o| < 2 the products are off by < 2*2^-14 each, and the
+    // output shift truncates by < 2^-14: total < 5 * 2^-14 = 3.1e-4.
+    // Saturated outputs are only checked bit-exactly.
+    task automatic check_rotation(input string name, input real angles [0:NUM_PAIRS-1]);
+        logic signed [15:0] exp_e, exp_o;
+        real  qe, qo, re, ro;
+        int   bad;
+        real  max_err;
+        bad = 0;
+        max_err = 0.0;
+        for (int i = 0; i < NUM_PAIRS; i++) begin
+            exp_e = sat_shift(longint'(q_int[2*i]) * cos_int[i] - longint'(q_int[2*i+1]) * sin_int[i]);
+            exp_o = sat_shift(longint'(q_int[2*i]) * sin_int[i] + longint'(q_int[2*i+1]) * cos_int[i]);
+            if (out_int[2*i] !== exp_e || out_int[2*i+1] !== exp_o) begin
+                $display("[TB]   FAIL %s pair %0d: got (%0d, %0d), bit-exact model (%0d, %0d)",
+                         name, i, out_int[2*i], out_int[2*i+1], exp_e, exp_o);
+                bad++;
+            end
+            qe = from_q1_14(q_int[2*i]);
+            qo = from_q1_14(q_int[2*i+1]);
+            re = qe * $cos(angles[i]) - qo * $sin(angles[i]);
+            ro = qe * $sin(angles[i]) + qo * $cos(angles[i]);
+            if (exp_e != 16'sd32767 && exp_e != -16'sd32768 && abs_real(from_q1_14(out_int[2*i]) - re) > max_err)
+                max_err = abs_real(from_q1_14(out_int[2*i]) - re);
+            if (exp_o != 16'sd32767 && exp_o != -16'sd32768 && abs_real(from_q1_14(out_int[2*i+1]) - ro) > max_err)
+                max_err = abs_real(from_q1_14(out_int[2*i+1]) - ro);
+        end
+        if (last_at_done !== out_int[HEAD_DIM-1]) begin
+            $display("[TB]   FAIL %s: out[%0d] read during done = %0d, later %0d",
+                     name, HEAD_DIM-1, last_at_done, out_int[HEAD_DIM-1]);
+            bad++;
+        end
+        if (max_err > 5.0 / 16384.0) begin
+            $display("[TB]   FAIL %s: max error vs real rotation %.6f > %.6f", name, max_err, 5.0 / 16384.0);
+            bad++;
+        end
+        if (bad == 0)
+            $display("[TB] PASS %s (bit-exact; max error vs real rotation %.6f)", name, max_err);
+        errors += bad;
     endtask
 
     // -----------------------------------------------------------------------
@@ -549,7 +641,7 @@ module tb_rope_unit;
     real angles_pos0 [0:NUM_PAIRS-1];
     real angles_pos1 [0:NUM_PAIRS-1];
     real output_vec  [0:HEAD_DIM-1];
-    real max_err;
+    int  positions [5] = '{1, 7, 100, 1000, 4095};
 
     initial begin
         $display("=== RoPE Unit Testbench ===");
@@ -575,29 +667,23 @@ module tb_rope_unit;
         // All angles = 0 => cos=1, sin=0
         for (int i = 0; i < NUM_PAIRS; i++) angles_pos0[i] = 0.0;
 
-        // Input: alternating 1.0 and 0.0
+        // Input: alternating 1.0 and 0.0 (with one negative and one
+        // non-integer element so sign handling is visible)
         for (int i = 0; i < HEAD_DIM; i++)
             input_vec[i] = (i % 2 == 0) ? 1.0 : 0.0;
-        // Clamp to Q1.14 range
-        input_vec[0] = 0.9999; // 1.0 overflows Q1.14 (max is 32767/16384 < 1.0)
+        input_vec[0] = 0.9999;
+        input_vec[4] = -1.0;
 
         load_sincos(angles_pos0);
         load_vector(input_vec);
         do_rotate();
         read_output(output_vec);
-
-        $display("[TB] Input  | Output | Diff");
-        max_err = 0.0;
-        for (int i = 0; i < HEAD_DIM; i++) begin
-            real diff;
-            diff = abs_real(output_vec[i] - input_vec[i]);
-            if (diff > max_err) max_err = diff;
-            $display("  [%0d] %.5f | %.5f | %.5f", i, input_vec[i], output_vec[i], diff);
-        end
-        if (max_err < 0.001)
-            $display("[TB] PASS Test 1: max error = %.6f (< 0.001)", max_err);
-        else
-            $display("[TB] FAIL Test 1: max error = %.6f (>= 0.001)", max_err);
+        check_rotation("Test 1 (identity)", angles_pos0);
+        for (int i = 0; i < HEAD_DIM; i++)
+            if (out_int[i] !== q_int[i]) begin
+                $display("[TB]   FAIL Test 1: out[%0d] = %0d, input %0d", i, out_int[i], q_int[i]);
+                errors++;
+            end
 
         // -------------------------------------------------------------------
         // TEST 2: Rotation by pi/4 on pair 0, zero angle on other pairs
@@ -620,17 +706,7 @@ module tb_rope_unit;
 
         $display("[TB] Expected: q'[0] ≈ %.5f, q'[1] ≈ %.5f", $cos(3.14159/4.0), $sin(3.14159/4.0));
         $display("[TB] Got:      q'[0] = %.5f, q'[1] = %.5f", output_vec[0], output_vec[1]);
-
-        begin
-            real err0, err1;
-            err0 = abs_real(output_vec[0] - $cos(3.14159265/4.0));
-            err1 = abs_real(output_vec[1] - $sin(3.14159265/4.0));
-            $display("[TB] Errors: q'[0] err=%.6f, q'[1] err=%.6f", err0, err1);
-            if (err0 < 0.005 && err1 < 0.005)
-                $display("[TB] PASS Test 2");
-            else
-                $display("[TB] FAIL Test 2");
-        end
+        check_rotation("Test 2 (pair 0 by pi/4)", angles_pos1);
 
         // -------------------------------------------------------------------
         // TEST 3: Verify orthogonal pairs are independent
@@ -647,7 +723,6 @@ module tb_rope_unit;
         input_vec[3] = 0.9999; // q[3] = 1.0 (odd element of pair 1)
         // pair 1 = (q[2], q[3]) = (0.0, 1.0)
         // rotation by pi/2: q'[2] = 0*cos - 1*sin = -1, q'[3] = 0*sin + 1*cos = 0
-        // cos(pi/2)=0, sin(pi/2)=1 => q'[2] = -q[3] = -1, q'[3] = q[2] = 0
 
         load_sincos(angles_pos1);
         load_vector(input_vec);
@@ -656,19 +731,51 @@ module tb_rope_unit;
 
         $display("[TB] Expected: q'[2] ≈ -1.0, q'[3] ≈ 0.0");
         $display("[TB] Got:      q'[2] = %.5f, q'[3] = %.5f", output_vec[2], output_vec[3]);
+        check_rotation("Test 3 (pair 1 by pi/2)", angles_pos1);
 
-        begin
-            real err2, err3;
-            err2 = abs_real(output_vec[2] - (-1.0 * input_vec[3]));
-            err3 = abs_real(output_vec[3]);
-            if (err2 < 0.005 && err3 < 0.005)
-                $display("[TB] PASS Test 3");
-            else
-                $display("[TB] FAIL Test 3: err2=%.6f, err3=%.6f", err2, err3);
+        // -------------------------------------------------------------------
+        // TEST 4: real RoPE angles pos * theta_i, theta_i = 10000^(-2i/HEAD_DIM),
+        // random vectors in (-1, 1), several positions: every pair has a
+        // different angle, so any pair/bank mis-mapping shows up
+        // -------------------------------------------------------------------
+        $display("");
+        $display("--- Test 4: RoPE angles at positions 1, 7, 100, 1000, 4095 ---");
+        foreach (positions[p]) begin
+            for (int i = 0; i < NUM_PAIRS; i++)
+                angles_pos1[i] = positions[p] * (10000.0 ** (-2.0 * i / HEAD_DIM));
+            for (int i = 0; i < HEAD_DIM; i++)
+                input_vec[i] = ($urandom_range(20000) - 10000) / 10000.0;
+            load_sincos(angles_pos1);
+            load_vector(input_vec);
+            do_rotate();
+            read_output(output_vec);
+            check_rotation($sformatf("Test 4 (pos %0d)", positions[p]), angles_pos1);
+        end
+
+        // -------------------------------------------------------------------
+        // TEST 5: saturation -- pair (1.9, 1.9) rotated by pi/4 has magnitude
+        // 2.69 in the odd output, beyond Q1.14's [-2, 2): must clamp to 32767
+        // -------------------------------------------------------------------
+        $display("");
+        $display("--- Test 5: output saturation ---");
+        for (int i = 0; i < NUM_PAIRS; i++)
+            angles_pos1[i] = (i == 2) ? 3.14159265358979 / 4.0 : 0.0;
+        for (int i = 0; i < HEAD_DIM; i++) input_vec[i] = 0.5;
+        input_vec[4] = 1.9;
+        input_vec[5] = 1.9;
+        load_sincos(angles_pos1);
+        load_vector(input_vec);
+        do_rotate();
+        read_output(output_vec);
+        check_rotation("Test 5 (saturation)", angles_pos1);
+        if (out_int[5] !== 16'sd32767) begin
+            $display("[TB]   FAIL Test 5: out[5] = %0d, expected saturation to 32767", out_int[5]);
+            errors++;
         end
 
         $display("");
-        $display("=== All RoPE tests complete ===");
+        if (errors == 0) $display("=== All RoPE tests PASSED ===");
+        else             $display("=== RoPE tests FAILED: %0d error(s) ===", errors);
         $finish;
     end
 

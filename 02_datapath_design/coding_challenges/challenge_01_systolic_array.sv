@@ -80,9 +80,10 @@ module pe #(
     input  logic                   clk,
     input  logic                   rst_n,
     input  logic                   clear,          // Clear accumulator (start of new tile)
-    input  logic                   en,             // Enable: when high, perform MAC
+    input  logic                   en,             // a_in/b_in valid: when high, perform MAC
     input  logic signed [DATA_W-1:0] a_in,         // Activation from left
     input  logic signed [DATA_W-1:0] b_in,         // Weight from top
+    output logic                   en_out,         // Valid travelling with a_out (to right)
     output logic signed [DATA_W-1:0] a_out,        // Activation to right
     output logic signed [DATA_W-1:0] b_out,        // Weight downward
     output logic signed [ACC_W-1:0]  acc_out        // Local accumulator value
@@ -97,19 +98,20 @@ module pe #(
     always_ff @(posedge clk) begin
         if (!rst_n || clear) begin
             acc_reg <= '0;
+            en_out  <= 1'b0;
             a_out   <= '0;
             b_out   <= '0;
-        end else if (en) begin
-            // Accumulate: sign-extend product to ACC_W before adding
-            acc_reg <= acc_reg + ACC_W'(signed'(product));
-            // Propagate data to neighbours
+        end else begin
+            // Accumulate only when the operands are valid: sign-extend the
+            // product to ACC_W before adding
+            if (en)
+                acc_reg <= acc_reg + ACC_W'(signed'(product));
+            // Propagate data (and its valid) to neighbours every cycle, so the
+            // one-cycle-per-hop pipeline timing never depends on en
+            en_out  <= en;
             a_out   <= a_in;
             b_out   <= b_in;
         end
-        // When en=0 (not valid), registers hold their value (no accumulation)
-        // but data propagation must still occur to maintain pipeline timing.
-        // In this implementation, propagation is gated by en for simplicity.
-        // A production design would decouple propagation from accumulation.
     end
 
     assign acc_out = acc_reg;
@@ -164,13 +166,13 @@ module systolic_array #(
     logic signed [N-1:0][DATA_W-1:0] a_skewed; // a_skewed[i] = a_in[i] delayed i cycles
     logic signed [N-1:0][DATA_W-1:0] b_skewed; // b_skewed[j] = b_in[j] delayed j cycles
 
-    // valid_in skewing: valid_in must also be skewed per row/col so PEs know when to accumulate.
-    // Simpler approach: use the skewed data itself (non-zero indicates valid).
-    // For clarity we skew a separate valid signal array.
+    // valid_in skewing: valid_in is skewed with row i of A, then travels right
+    // through the PEs alongside the a data (see pe.en_out). A reaches PE(i,j)
+    // after i (skew) + j (hops) cycles and B after j (skew) + i (hops) cycles,
+    // so the valid carried with A marks exactly the cycles in which both
+    // operands at PE(i,j) belong to the same k -- no separate B valid needed.
     logic [N-1:0] a_valid_shift [N]; // a_valid_shift[row][stage]
-    logic [N-1:0] b_valid_shift [N]; // b_valid_shift[col][stage]
     logic [N-1:0] a_valid_skewed;
-    logic [N-1:0] b_valid_skewed;
     logic [N-1:0] pe_en [N]; // pe_en[i][j] = enable for PE(i,j)
 
     // Build skewing shift registers
@@ -211,62 +213,49 @@ module systolic_array #(
         for (gi = 0; gi < N; gi++) begin : gen_skew_col
             if (gi == 0) begin : no_delay_col
                 assign b_skewed[0]      = b_in[0];
-                assign b_valid_skewed[0] = valid_in;
             end else begin : delay_col
                 always_ff @(posedge clk) begin
-                    if (!rst_n) begin
-                        b_shift[gi][0]       <= '0;
-                        b_valid_shift[gi][0] <= 1'b0;
-                    end else begin
-                        b_shift[gi][0]       <= b_in[gi];
-                        b_valid_shift[gi][0] <= valid_in;
-                    end
+                    if (!rst_n)
+                        b_shift[gi][0] <= '0;
+                    else
+                        b_shift[gi][0] <= b_in[gi];
                 end
                 for (gd = 1; gd < gi; gd++) begin : gen_b_stages
                     always_ff @(posedge clk) begin
-                        if (!rst_n) begin
-                            b_shift[gi][gd]       <= '0;
-                            b_valid_shift[gi][gd] <= 1'b0;
-                        end else begin
-                            b_shift[gi][gd]       <= b_shift[gi][gd-1];
-                            b_valid_shift[gi][gd] <= b_valid_shift[gi][gd-1];
-                        end
+                        if (!rst_n)
+                            b_shift[gi][gd] <= '0;
+                        else
+                            b_shift[gi][gd] <= b_shift[gi][gd-1];
                     end
                 end
                 assign b_skewed[gi]      = b_shift[gi][gi-1];
-                assign b_valid_skewed[gi] = b_valid_shift[gi][gi-1];
             end
         end
     endgenerate
 
-    // PE enable: PE[i][j] is enabled when both its row and column have valid data
-    genvar gr, gc;
-    generate
-        for (gr = 0; gr < N; gr++) begin : gen_pe_en_row
-            for (gc = 0; gc < N; gc++) begin : gen_pe_en_col
-                assign pe_en[gr][gc] = a_valid_skewed[gr] & b_valid_skewed[gc];
-            end
-        end
-    endgenerate
 
     // -------------------------------------------------------------------------
     // PE array instantiation and interconnect
     // Horizontal: a data flows left to right through PEs in each row.
     //             a_wire[i][j] = output of PE(i,j-1), fed into PE(i,j).
     //             a_wire[i][0] = a_skewed[i] (from left edge).
+    //             pe_en[i][j] travels with a: pe_en[i][0] = a_valid_skewed[i],
+    //             pe_en[i][j+1] = en_out of PE(i,j).
     // Vertical:   b data flows top to bottom through PEs in each column.
     //             b_wire[i][j] = output of PE(i-1,j), fed into PE(i,j).
     //             b_wire[0][j] = b_skewed[j] (from top edge).
     // -------------------------------------------------------------------------
 
-    logic signed [N:0][N-1:0][DATA_W-1:0]   a_wire; // a_wire[row][col], col 0 = left input
-    logic signed [N-1:0][N:0][DATA_W-1:0]   b_wire; // b_wire[row][col], row 0 = top input
+    logic signed [N-1:0][N:0][DATA_W-1:0]   a_wire; // a_wire[row][col], col 0 = left input
+    logic signed [N:0][N-1:0][DATA_W-1:0]   b_wire; // b_wire[row][col], row 0 = top input
+    logic        [N-1:0][N:0]               v_wire; // v_wire[row][col], valid alongside a_wire
 
     // Connect left-edge and top-edge inputs
     genvar gi2;
     generate
         for (gi2 = 0; gi2 < N; gi2++) begin : gen_edge_connect
             assign a_wire[gi2][0] = a_skewed[gi2];   // Left edge of each row
+            assign v_wire[gi2][0] = a_valid_skewed[gi2];
             assign b_wire[0][gi2] = b_skewed[gi2];   // Top edge of each column
         end
     endgenerate
@@ -286,10 +275,12 @@ module systolic_array #(
                     .en     (pe_en[row][col]),
                     .a_in   (a_wire[row][col]),      // From left neighbour
                     .b_in   (b_wire[row][col]),      // From top neighbour
+                    .en_out (v_wire[row][col+1]),    // Valid to right neighbour
                     .a_out  (a_wire[row][col+1]),    // To right neighbour
                     .b_out  (b_wire[row+1][col]),    // To bottom neighbour
                     .acc_out(c_out[row][col])         // Output accumulator
                 );
+                assign pe_en[row][col] = v_wire[row][col];
             end
         end
     endgenerate
@@ -340,7 +331,9 @@ endmodule : systolic_array
 //
 //   Expected C = A × B = A
 //
-// A separate second test multiplies A × A (using pre-computed expected values).
+// Further tests: A × A and random signed INT8 A × B (expected values from the
+// ref_matmul reference model), and A × 0. Each test also checks the valid_out
+// latency and pulse width; the final verdict depends on the error count.
 // =============================================================================
 
 module tb_systolic_array;
@@ -398,6 +391,8 @@ module tb_systolic_array;
     logic signed [DATA_W-1:0] mat_b_col [N][K]; // mat_b_col[col][row]
     // Expected result
     logic signed [ACC_W-1:0] expected_c [N][N];
+    // Mismatch / protocol error count; the final verdict depends on it
+    int errors = 0;
 
     // -------------------------
     // Task: drive one GEMM computation
@@ -408,12 +403,15 @@ module tb_systolic_array;
         input logic signed [ACC_W-1:0]  exp_c [N][N]
     );
         integer k_step, i, j;
+        int     lat;
         // Assert load_c for one cycle to clear accumulators
+        // While valid_in is low the operands are don't-care: drive junk so a
+        // PE that accumulated without its enable would be caught
         @(negedge clk);
         load_c   = 1'b1;
         valid_in = 1'b0;
-        a_in     = '0;
-        b_in     = '0;
+        a_in     = $urandom;
+        b_in     = $urandom;
         @(negedge clk);
         load_c   = 1'b0;
 
@@ -432,35 +430,51 @@ module tb_systolic_array;
         // Deassert valid_in after K cycles
         @(negedge clk);
         valid_in = 1'b0;
-        a_in     = '0;
-        b_in     = '0;
+        a_in     = $urandom;
+        b_in     = $urandom;
 
-        // Wait for valid_out
-        // Maximum wait: 2*(N-1) + K + N + a few cycles margin
+        // Wait for valid_out. Counting the posedge that samples the first
+        // valid_in as posedge 1 (K posedges have been seen so far),
+        // PE[N-1][N-1] gets that operand pair 2*(N-1) posedges later and does
+        // its last MAC on posedge 2*(N-1) + K; valid_out rises just after it.
+        lat = K;
         fork
             begin : wait_valid
                 repeat (2*N + K + 5) @(posedge clk);
-                $display("TIMEOUT: valid_out never asserted");
+                $display("FAIL: TIMEOUT -- valid_out never asserted");
                 $finish;
             end
             begin : check_valid
-                wait (valid_out === 1'b1);
+                while (valid_out !== 1'b1) begin
+                    @(posedge clk);
+                    #1 lat++;
+                end
                 disable wait_valid;
             end
         join
+        if (lat != 2*(N-1) + K) begin
+            $display("FAIL: valid_out latency = %0d cycles, expected %0d", lat, 2*(N-1) + K);
+            errors++;
+        end
 
-        // Check results
-        @(posedge clk); // Sample on the clock after valid_out
+        // Check results while valid_out is high (accumulators hold afterwards
+        // too, since no PE is enabled once the last operands have passed)
         $display("--- GEMM Result ---");
         for (i = 0; i < N; i++) begin
             for (j = 0; j < N; j++) begin
                 if (c_out[i][j] !== exp_c[i][j]) begin
                     $display("FAIL: C[%0d][%0d] = %0d, expected %0d",
                               i, j, c_out[i][j], exp_c[i][j]);
+                    errors++;
                 end else begin
                     $display("PASS: C[%0d][%0d] = %0d", i, j, c_out[i][j]);
                 end
             end
+        end
+        @(posedge clk); #1;
+        if (valid_out !== 1'b0) begin
+            $display("FAIL: valid_out is not a one-cycle pulse");
+            errors++;
         end
     endtask
 
@@ -469,15 +483,20 @@ module tb_systolic_array;
     // -------------------------
     function automatic void ref_matmul(
         input  logic signed [DATA_W-1:0] a [N][K],
-        input  logic signed [DATA_W-1:0] b [N][K],   // b[row][k]
+        input  logic signed [DATA_W-1:0] b [K][N],   // b[k][col], row-major B
         output logic signed [ACC_W-1:0]  c [N][N]
     );
         integer i, j, k;
+        logic signed [ACC_W-1:0] prod;
         for (i = 0; i < N; i++) begin
             for (j = 0; j < N; j++) begin
                 c[i][j] = '0;
                 for (k = 0; k < K; k++) begin
-                    c[i][j] = c[i][j] + (ACC_W)'(signed'(a[i][k]) * signed'(b[j][k]));
+                    // Multiply at ACC_W bits (a cast would make the multiply
+                    // self-determined at DATA_W bits and overflow)
+                    prod    = a[i][k];
+                    prod    = prod * b[k][j];
+                    c[i][j] = c[i][j] + prod;
                 end
             end
         end
@@ -487,7 +506,7 @@ module tb_systolic_array;
     // Main test sequence
     // -------------------------
     integer i, j, k;
-    logic signed [DATA_W-1:0] mat_b [N][K]; // b in row-major for ref model
+    logic signed [DATA_W-1:0] mat_b [K][N]; // b in row-major for ref model
 
     initial begin
         // Initialise signals
@@ -513,8 +532,8 @@ module tb_systolic_array;
                 mat_a[i][j] = 8'(i * K + j + 1);
 
         // Fill mat_b = identity
-        for (i = 0; i < N; i++)
-            for (j = 0; j < K; j++)
+        for (i = 0; i < K; i++)
+            for (j = 0; j < N; j++)
                 mat_b[i][j] = (i == j) ? 8'd1 : 8'd0;
 
         // Build b_col (column-major view of B for the array input)
@@ -537,8 +556,8 @@ module tb_systolic_array;
 
         // Reuse mat_a (same matrix) for both operands
         // mat_b = mat_a for this test
-        for (i = 0; i < N; i++)
-            for (j = 0; j < K; j++)
+        for (i = 0; i < K; i++)
+            for (j = 0; j < N; j++)
                 mat_b[i][j] = mat_a[i][j];
 
         for (j = 0; j < N; j++)
@@ -548,7 +567,7 @@ module tb_systolic_array;
         // Compute expected C = A × A via reference model
         ref_matmul(mat_a, mat_b, expected_c);
 
-        $display("Expected C = A × A:");
+        $display("Expected C = A × A (reference model):");
         for (i = 0; i < N; i++) begin
             for (j = 0; j < N; j++)
                 $write("%8d ", expected_c[i][j]);
@@ -562,8 +581,8 @@ module tb_systolic_array;
         // -----------------------------------------------
         $display("\n=== Test 3: A × 0 = 0 ===");
 
-        for (i = 0; i < N; i++)
-            for (j = 0; j < K; j++)
+        for (i = 0; i < K; i++)
+            for (j = 0; j < N; j++)
                 mat_b[i][j] = 8'd0;
 
         for (j = 0; j < N; j++)
@@ -576,7 +595,29 @@ module tb_systolic_array;
 
         run_gemm(mat_a, mat_b_col, expected_c);
 
-        $display("\n=== All tests complete ===");
+        // -----------------------------------------------
+        // Test 4: random signed INT8 A × B, with row 0 of A and column 0 of
+        // B forced to -128 so C[0][0] = K * 16384 exercises the full signed
+        // product range and accumulation beyond 16 bits
+        // -----------------------------------------------
+        $display("\n=== Test 4: random signed A × B ===");
+
+        for (i = 0; i < N; i++)
+            for (j = 0; j < K; j++)
+                mat_a[i][j] = (i == 0) ? -8'sd128 : DATA_W'($urandom);
+        for (i = 0; i < K; i++)
+            for (j = 0; j < N; j++)
+                mat_b[i][j] = (j == 0) ? -8'sd128 : DATA_W'($urandom);
+        for (j = 0; j < N; j++)
+            for (k = 0; k < K; k++)
+                mat_b_col[j][k] = mat_b[k][j];
+
+        ref_matmul(mat_a, mat_b, expected_c);
+        run_gemm(mat_a, mat_b_col, expected_c);
+
+        $display("\n=== All tests complete: %0d error(s) ===", errors);
+        if (errors == 0) $display("ALL TESTS PASSED");
+        else             $display("TESTS FAILED");
         $finish;
     end
 

@@ -99,8 +99,8 @@ module fp16_mul_to_fp32 (
     assign b_inf  = (b_exp == 5'b11111) & (b_mant == 10'd0);
     assign a_nan  = (a_exp == 5'b11111) & (a_mant != 10'd0);
     assign b_nan  = (b_exp == 5'b11111) & (b_mant != 10'd0);
-    assign a_zero = (a_exp == 5'd0) & (a_mant == 10'd0);  // Flush subnormals to zero
-    assign b_zero = (b_exp == 5'd0) & (b_mant == 10'd0);
+    assign a_zero = (a_exp == 5'd0);  // Zero or subnormal: flush to zero (FTZ)
+    assign b_zero = (b_exp == 5'd0);
 
     // -------------------------
     // Compute result sign
@@ -237,13 +237,22 @@ module fp32_add (
     assign a_sig24 = (a_exp != 8'd0) ? {1'b1, a_mant} : 24'd0;
     assign b_sig24 = (b_exp != 8'd0) ? {1'b1, b_mant} : 24'd0;
 
-    // Align smaller exponent operand (right shift by exp_diff, keep 3 guard bits)
-    // Cap shift at 27 to avoid undefined behaviour
-    logic [5:0] shift_amt;
-    assign shift_amt = (exp_diff > 6'd27) ? 6'd27 : exp_diff[5:0];
+    // Align smaller exponent operand (right shift by exp_diff, keep 3 guard bits:
+    // guard, round, sticky). Bits shifted out below the sticky position are ORed
+    // into it so round-to-nearest-even sees them. Cap shift at 27 (everything
+    // is then sticky).
+    logic [5:0]  shift_amt;
+    logic [26:0] a_ext, b_ext, small_ext, small_shifted;
+    logic        small_sticky;
+    assign shift_amt = (exp_diff > 8'd27) ? 6'd27 : exp_diff[5:0];
+    assign a_ext     = {a_sig24, 3'b000};
+    assign b_ext     = {b_sig24, 3'b000};
+    assign small_ext = a_larger ? b_ext : a_ext;
+    assign small_shifted = small_ext >> shift_amt;
+    assign small_sticky  = |(small_ext & ~(27'h7FFFFFF << shift_amt));
 
-    assign a_sig_shifted = a_larger ? {a_sig24, 3'b000} : ({a_sig24, 3'b000} >> shift_amt);
-    assign b_sig_shifted = a_larger ? ({b_sig24, 3'b000} >> shift_amt) : {b_sig24, 3'b000};
+    assign a_sig_shifted = a_larger ? a_ext : (small_shifted | {26'd0, small_sticky});
+    assign b_sig_shifted = a_larger ? (small_shifted | {26'd0, small_sticky}) : b_ext;
 
     // Add or subtract based on effective signs
     logic effective_add; // 1 = add magnitudes, 0 = subtract
@@ -268,12 +277,16 @@ module fp32_add (
         end
     end
 
-    // Normalise result
+    // Normalise result so the hidden bit sits at norm_sig[26]:
     // If carry out (sum_raw[27]=1): result = 1X.XXX, shift right, exp++
-    // Otherwise: leading-zero count to normalise left shifts
-    logic [7:0]  norm_exp;
+    // (the bit shifted out is folded into sticky).
+    // Otherwise: leading-zero count to normalise left shifts. A left shift of
+    // 2 or more only happens when exp_diff <= 1, when no bits were lost.
+    logic signed [9:0] norm_exp;   // wide + signed to catch overflow/underflow
     logic [26:0] norm_sig;
-    logic [22:0] rounded_mant;
+    logic [23:0] rounded_sig;      // hidden bit + 23-bit mantissa after rounding
+    logic        round_up;
+    logic signed [9:0] final_exp_f;
 
     // Leading-zero count for normalisation (simplified: check bit-by-bit)
     logic [4:0] lzc; // Leading zero count in sum_raw[26:0]
@@ -288,30 +301,39 @@ module fp32_add (
     always_comb begin
         if (sum_raw[27]) begin
             // Carry: shift right by 1, increment exponent
-            norm_exp = result_exp + 8'd1;
-            norm_sig = sum_raw[27:1]; // Drop the LSB (rounding simplified here)
+            norm_exp = $signed({2'b00, result_exp}) + 10'sd1;
+            norm_sig = {sum_raw[27:2], sum_raw[1] | sum_raw[0]};
         end else if (sum_raw == 28'd0) begin
-            norm_exp = 8'd0;
+            norm_exp = 10'sd0;
             norm_sig = 27'd0;
         end else begin
             // Left-normalise
-            norm_exp = result_exp - {3'd0, lzc};
+            norm_exp = $signed({2'b00, result_exp}) - $signed({5'd0, lzc});
             norm_sig = sum_raw[26:0] << lzc;
         end
-        // Round to nearest (truncate the 3 guard bits for simplicity here)
-        rounded_mant = norm_sig[26:4];
+        // Round to nearest, ties to even: guard = norm_sig[2],
+        // round|sticky = norm_sig[1:0], LSB of the kept mantissa = norm_sig[3]
+        round_up    = norm_sig[2] & ((|norm_sig[1:0]) | norm_sig[3]);
+        rounded_sig = norm_sig[26:3] + {23'd0, round_up};
+        final_exp_f = norm_exp;
+        // Rounding carried out of the significand (1.111..1 -> 10.000..0)
+        if (round_up && norm_sig[26:3] == 24'hFFFFFF) begin
+            rounded_sig = 24'h800000;
+            final_exp_f = norm_exp + 10'sd1;
+        end
     end
 
     // Final result assembly
     logic result_nan_f, result_inf_f, result_zero_f;
     assign result_nan_f  = a_nan | b_nan | (a_inf & b_inf & (a_sign ^ b_sign));
-    assign result_inf_f  = (a_inf | b_inf | (norm_exp == 8'hFF)) & ~result_nan_f;
-    assign result_zero_f = (sum_raw == 28'd0) & ~result_nan_f;
+    assign result_inf_f  = (a_inf | b_inf | (final_exp_f >= 10'sd255)) & ~result_nan_f;
+    // Exact zero, or underflow below the smallest normal (flush to zero)
+    assign result_zero_f = ((sum_raw == 28'd0) | (final_exp_f <= 10'sd0)) & ~result_nan_f & ~result_inf_f;
 
     assign result = result_nan_f  ? 32'h7FC00000 :  // Quiet NaN
-                    result_inf_f  ? {result_sign_int, 8'hFF, 23'd0} :
+                    result_inf_f  ? {(a_inf ? a_sign : b_inf ? b_sign : result_sign_int), 8'hFF, 23'd0} :
                     result_zero_f ? 32'd0 :
-                    {result_sign_int, norm_exp, rounded_mant};
+                    {result_sign_int, final_exp_f[7:0], rounded_sig[22:0]};
 
 endmodule : fp32_add
 
@@ -427,11 +449,26 @@ module mac_unit_mixed_precision #(
     logic signed [INT_ACC_W-1:0] int32_product_extended;
     assign int32_product_extended = INT_ACC_W'(signed'(s2_int8_product));
 
+    // Saturating add: one extra bit catches overflow, then clamp to the INT32
+    // range (the result sticks at the rail rather than wrapping)
+    logic signed [INT_ACC_W:0]   int32_sum_wide;
+    logic signed [INT_ACC_W-1:0] int32_sum_sat;
+    localparam logic signed [INT_ACC_W:0] INT_MAX_W = (INT_ACC_W+1)'((64'sd1 <<< (INT_ACC_W-1)) - 1);
+    localparam logic signed [INT_ACC_W:0] INT_MIN_W = -(INT_MAX_W + 1);
+    assign int32_sum_wide = {int32_acc_reg[INT_ACC_W-1], int32_acc_reg}
+                          + {int32_product_extended[INT_ACC_W-1], int32_product_extended};
+    assign int32_sum_sat  = (int32_sum_wide > INT_MAX_W) ? INT_MAX_W[INT_ACC_W-1:0] :
+                            (int32_sum_wide < INT_MIN_W) ? INT_MIN_W[INT_ACC_W-1:0] :
+                                                           int32_sum_wide[INT_ACC_W-1:0];
+
+    // clear only affects the accumulator of the mode it arrives with, so a
+    // tile in one mode never disturbs the other mode's accumulator
     always_comb begin
-        if (s2_clear) begin
-            int32_acc_next = int32_product_extended; // Clear then accumulate
+        if (s2_clear && ~s2_mode) begin
+            // Clear then accumulate (or just clear if no valid data came with it)
+            int32_acc_next = s2_valid ? int32_product_extended : '0;
         end else if (s2_valid && ~s2_mode) begin
-            int32_acc_next = int32_acc_reg + int32_product_extended;
+            int32_acc_next = int32_sum_sat;
         end else begin
             int32_acc_next = int32_acc_reg;
         end
@@ -449,8 +486,9 @@ module mac_unit_mixed_precision #(
     );
 
     always_comb begin
-        if (s2_clear) begin
-            fp32_acc_next = s2_fp32_product; // Clear then accumulate
+        if (s2_clear && s2_mode) begin
+            // Clear then accumulate (or just clear to +0.0 if no valid data)
+            fp32_acc_next = s2_valid ? s2_fp32_product : 32'h00000000;
         end else if (s2_valid && s2_mode) begin
             fp32_acc_next = fp32_add_result;
         end else begin
@@ -499,6 +537,14 @@ endmodule : mac_unit_mixed_precision
 //     Expected: 1.0*2.0 + 0.5*4.0 + 3.0*(-1.0) = 2.0 + 2.0 - 3.0 = 1.0
 //
 //   Test 3: Mode switch (INT8 → FP16), verify correct accumulator isolation
+//   Test 4: clear starts a new INT8 tile; FP32 accumulator untouched by it
+//   Test 5: 50 random INT8 tiles vs an integer reference
+//   Test 6: 50 random FP16 tiles, bit-exact vs an FP32 round-to-nearest-even
+//           reference (ref_fp_acc)
+//   Test 7: FP16 specials -- subnormal FTZ, Inf, Inf-Inf, Inf*0, NaN, and a
+//           carry-out rounding case that needs the sticky bit
+//   Test 8: INT32 saturation at both rails
+// Every check is bit-exact and counted; the final verdict depends on the count.
 //
 // FP16 encoding helpers are included in the testbench.
 // =============================================================================
@@ -624,13 +670,42 @@ module tb_mac_unit_mixed_precision;
         result = acc_int32;
     endtask
 
+    // FP16 bit pattern to real (subnormals flushed to zero, like the DUT;
+    // only used for finite values)
+    function automatic real fp16_to_real(input logic [15:0] h);
+        real v;
+        if (h[14:10] == 5'd0) return 0.0;
+        v = 1.0 + real'(h[9:0]) / 1024.0;
+        for (int i = 15; i < int'(h[14:10]); i++) v *= 2.0;
+        for (int i = 15; i > int'(h[14:10]); i--) v /= 2.0;
+        return h[15] ? -v : v;
+    endfunction
+
+    // Reference FP16-mode tile: each FP16 x FP16 product is exact in double
+    // (22-bit significand); each accumulate is a double add rounded once to
+    // FP32. Because 53 >= 2*24 + 2, rounding the double sum of two FP32
+    // values to FP32 equals a single correctly-rounded (RNE) FP32 add.
+    // The rounding is forced through $shortrealtobits: a simulator may hold
+    // shortreal variables at double precision (xsim 2025.2 does), so a plain
+    // shortreal accumulator would silently skip the per-step FP32 rounding.
+    function automatic logic [31:0] ref_fp_acc(input logic [15:0] a_vals[], input logic [15:0] b_vals[]);
+        logic [31:0] acc_bits;
+        real         p;
+        foreach (a_vals[i]) begin
+            p        = fp16_to_real(a_vals[i]) * fp16_to_real(b_vals[i]);
+            acc_bits = (i == 0) ? $shortrealtobits(shortreal'(p))
+                                : $shortrealtobits(shortreal'(real'($bitstoshortreal(acc_bits)) + p));
+        end
+        return acc_bits;
+    endfunction
+
     // -------------------------
-    // Task: FP16 MAC sequence
+    // Task: FP16 MAC sequence (raw FP16 bit patterns)
     // -------------------------
-    task automatic fp16_mac_sequence(
-        input real   a_vals[],
-        input real   b_vals[],
-        input int    n_pairs,
+    task automatic fp16_mac_bits(
+        input logic [15:0] a_vals[],
+        input logic [15:0] b_vals[],
+        input int          n_pairs,
         output logic [31:0] result
     );
         integer i;
@@ -638,15 +713,15 @@ module tb_mac_unit_mixed_precision;
         mode     = 1'b1;
         clear    = 1'b1;
         valid_in = 1'b1;
-        a_in     = to_fp16(a_vals[0]);
-        b_in     = to_fp16(b_vals[0]);
+        a_in     = a_vals[0];
+        b_in     = b_vals[0];
 
         @(negedge clk);
         clear = 1'b0;
 
         for (i = 1; i < n_pairs; i++) begin
-            a_in = to_fp16(a_vals[i]);
-            b_in = to_fp16(b_vals[i]);
+            a_in = a_vals[i];
+            b_in = b_vals[i];
             @(negedge clk);
         end
 
@@ -659,16 +734,51 @@ module tb_mac_unit_mixed_precision;
     endtask
 
     // -------------------------
+    // Task: FP16 MAC sequence (real values, converted with to_fp16)
+    // -------------------------
+    task automatic fp16_mac_sequence(
+        input real   a_vals[],
+        input real   b_vals[],
+        input int    n_pairs,
+        output logic [31:0] result
+    );
+        logic [15:0] a_bits[], b_bits[];
+        a_bits = new[n_pairs];
+        b_bits = new[n_pairs];
+        for (int i = 0; i < n_pairs; i++) begin
+            a_bits[i] = to_fp16(a_vals[i]);
+            b_bits[i] = to_fp16(b_vals[i]);
+        end
+        fp16_mac_bits(a_bits, b_bits, n_pairs, result);
+    endtask
+
+    // -------------------------
     // Main test
     // -------------------------
     logic [31:0] test_result;
     real         test_result_real;
     real         expected_real;
+    logic [31:0] expected_bits;
+    int          errors = 0;
+    int          exp_int;
 
     logic signed [7:0] int8_a[4];
     logic signed [7:0] int8_b[4];
     real fp16_a[3];
     real fp16_b[3];
+    logic signed [7:0] rnd_a[], rnd_b[];
+    logic [15:0]       rnd_fa[], rnd_fb[];
+    logic [15:0]       sp_a[], sp_b[];
+
+    // Check helper: bit-exact compare, count failures
+    task automatic check32(input string what, input logic [31:0] got, input logic [31:0] exp);
+        if (got === exp)
+            $display("PASS: %s = 0x%08h", what, got);
+        else begin
+            $display("FAIL: %s = 0x%08h (expected 0x%08h)", what, got, exp);
+            errors++;
+        end
+    endtask
 
     initial begin
         rst_n    = 1'b0;
@@ -693,11 +803,7 @@ module tb_mac_unit_mixed_precision;
         // Expected: 6 + 20 - 6 - 16256 = -16236
 
         int8_mac_sequence(int8_a, int8_b, 4, test_result);
-
-        if ($signed(test_result) == -32'sd16236)
-            $display("PASS: INT8 acc = %0d (expected -16236)", $signed(test_result));
-        else
-            $display("FAIL: INT8 acc = %0d (expected -16236)", $signed(test_result));
+        check32("INT8 acc (-16236)", test_result, -32'sd16236);
 
         // -----------------------------------------------
         // Test 2: FP16 mode
@@ -706,30 +812,20 @@ module tb_mac_unit_mixed_precision;
         fp16_a[0] = 1.0; fp16_b[0] =  2.0;  // 2.0
         fp16_a[1] = 0.5; fp16_b[1] =  4.0;  // 2.0
         fp16_a[2] = 3.0; fp16_b[2] = -1.0;  // -3.0
-        // Expected: 2.0 + 2.0 - 3.0 = 1.0
+        // Expected: 2.0 + 2.0 - 3.0 = 1.0 exactly (FP32 0x3F800000)
 
         fp16_mac_sequence(fp16_a, fp16_b, 3, test_result);
-
         test_result_real = fp32_to_real(test_result);
-        expected_real = 1.0;
-
-        if (abs_real(test_result_real - expected_real) < 0.01)
-            $display("PASS: FP16 acc = %f (expected 1.0)", test_result_real);
-        else
-            $display("FAIL: FP16 acc = %f (expected 1.0)", test_result_real);
+        $display("      FP16 acc = %f", test_result_real);
+        check32("FP16 acc (1.0)", test_result, 32'h3F800000);
 
         // -----------------------------------------------
         // Test 3: INT8 accumulator unaffected by FP16 ops
         // -----------------------------------------------
-        $display("\n=== Test 3: Accumulator isolation ===");
-        // After the FP16 test, the INT8 accumulator should be unchanged
-        // (still holds -16236 from test 1).
-        if ($signed(acc_int32) == -32'sd16236)
-            $display("PASS: INT8 accumulator preserved during FP16 test = %0d",
-                      $signed(acc_int32));
-        else
-            $display("FAIL: INT8 accumulator changed during FP16 test = %0d (expected -16236)",
-                      $signed(acc_int32));
+        $display("\n=== Test 3: Accumulator isolation (INT8 during FP16) ===");
+        // After the FP16 test (including its clear), the INT8 accumulator
+        // should be unchanged (still holds -16236 from test 1).
+        check32("INT8 acc after FP16 tile", acc_int32, -32'sd16236);
 
         // -----------------------------------------------
         // Test 4: INT8 edge case — clear between tiles
@@ -740,19 +836,111 @@ module tb_mac_unit_mixed_precision;
         // Expected: 110 (previous -16236 should be cleared)
 
         int8_mac_sequence(int8_a, int8_b, 2, test_result);
+        check32("INT8 acc after clear (110)", test_result, 32'sd110);
+        // ...and the FP32 accumulator must have kept 1.0 through the INT8 tile
+        check32("FP32 acc after INT8 tile", acc_fp32, 32'h3F800000);
 
-        if ($signed(test_result) == 32'sd110)
-            $display("PASS: After clear, INT8 acc = %0d (expected 110)", $signed(test_result));
-        else
-            $display("FAIL: After clear, INT8 acc = %0d (expected 110)", $signed(test_result));
+        // -----------------------------------------------
+        // Test 5: random INT8 tiles vs integer reference
+        // -----------------------------------------------
+        $display("\n=== Test 5: 50 random INT8 tiles of 16 ===");
+        rnd_a = new[16]; rnd_b = new[16];
+        for (int t = 0; t < 50; t++) begin
+            exp_int = 0;
+            for (int i = 0; i < 16; i++) begin
+                rnd_a[i] = $urandom; rnd_b[i] = $urandom;
+                exp_int += int'(rnd_a[i]) * int'(rnd_b[i]);
+            end
+            int8_mac_sequence(rnd_a, rnd_b, 16, test_result);
+            if (test_result !== exp_int) begin
+                $display("FAIL: random INT8 tile %0d = %0d (expected %0d)", t, $signed(test_result), exp_int);
+                errors++;
+            end
+        end
+        $display("      done (%0d errors so far)", errors);
 
-        $display("\n=== All MAC unit tests complete ===");
+        // -----------------------------------------------
+        // Test 6: random FP16 tiles, bit-exact vs FP32 RNE reference
+        // Exponent fields 5..25 (2^-10..2^10), random signs, so tiles exercise
+        // alignment shifts, cancellation and inexact (rounded) sums.
+        // -----------------------------------------------
+        $display("\n=== Test 6: 50 random FP16 tiles of 16 (bit-exact) ===");
+        rnd_fa = new[16]; rnd_fb = new[16];
+        for (int t = 0; t < 50; t++) begin
+            for (int i = 0; i < 16; i++) begin
+                rnd_fa[i] = {1'($urandom), 5'(5 + $urandom_range(20)), 10'($urandom)};
+                rnd_fb[i] = {1'($urandom), 5'(5 + $urandom_range(20)), 10'($urandom)};
+            end
+            expected_bits = ref_fp_acc(rnd_fa, rnd_fb);
+            fp16_mac_bits(rnd_fa, rnd_fb, 16, test_result);
+            if (t < 3) $display("      tile %0d: DUT 0x%08h ref 0x%08h (%g)", t, test_result, expected_bits,
+                                $bitstoshortreal(expected_bits));
+            if (test_result !== expected_bits) begin
+                $display("FAIL: random FP16 tile %0d = 0x%08h (expected 0x%08h)", t, test_result, expected_bits);
+                errors++;
+            end
+        end
+        $display("      done (%0d errors so far)", errors);
+
+        // -----------------------------------------------
+        // Test 7: FP16 special values
+        // -----------------------------------------------
+        $display("\n=== Test 7: FP16 specials (FTZ, Inf, NaN) ===");
+        sp_a = new[2]; sp_b = new[2];
+        // 2.0*1.0 + subnormal(0x0001)*1.0 -> subnormal flushed, exactly 2.0
+        sp_a = '{16'h4000, 16'h0001}; sp_b = '{16'h3C00, 16'h3C00};
+        fp16_mac_bits(sp_a, sp_b, 2, test_result);
+        check32("2.0 + subnormal*1.0 (FTZ)", test_result, 32'h40000000);
+        // +Inf*1.0 + 1.0*1.0 -> +Inf
+        sp_a = '{16'h7C00, 16'h3C00}; sp_b = '{16'h3C00, 16'h3C00};
+        fp16_mac_bits(sp_a, sp_b, 2, test_result);
+        check32("+Inf + 1.0", test_result, 32'h7F800000);
+        // +Inf*1.0 + (-Inf)*1.0 -> NaN
+        sp_a = '{16'h7C00, 16'hFC00}; sp_b = '{16'h3C00, 16'h3C00};
+        fp16_mac_bits(sp_a, sp_b, 2, test_result);
+        check32("+Inf + -Inf (NaN)", test_result, 32'h7FC00000);
+        // 1.0*1.0 + Inf*0 -> NaN
+        sp_a = '{16'h3C00, 16'h7C00}; sp_b = '{16'h3C00, 16'h0000};
+        fp16_mac_bits(sp_a, sp_b, 2, test_result);
+        check32("1.0 + Inf*0 (NaN)", test_result, 32'h7FC00000);
+        // NaN*1.0 + 1.0*1.0 -> NaN propagates through the accumulator
+        sp_a = '{16'h7E00, 16'h3C00}; sp_b = '{16'h3C00, 16'h3C00};
+        fp16_mac_bits(sp_a, sp_b, 2, test_result);
+        check32("NaN + 1.0", test_result, 32'h7FC00000);
+        // Rounding with carry-out: 0x3FFF^2 = 0x407FC004 plus 0x38F6*0x1E73 =
+        // 0x3B7FF410 is exactly 4 + 1.016 ulp(4). After the carry shift the
+        // guard bit is 1, round is 0 and only the lowest sticky bit is set, so
+        // RNE must round up to 0x40800001 (dropping that sticky bit on the
+        // carry shift would turn it into a tie and round to even, 0x40800000).
+        sp_a = '{16'h3FFF, 16'h38F6}; sp_b = '{16'h3FFF, 16'h1E73};
+        fp16_mac_bits(sp_a, sp_b, 2, test_result);
+        check32("carry + sticky rounding", test_result, 32'h40800001);
+
+        // -----------------------------------------------
+        // Test 8: INT32 saturation
+        // (-128)*(-128) = 16384 = 2^14; 131072 = 2^17 of them reach 2^31, one
+        // past INT32_MAX -> clamp to 0x7FFFFFFF. 127*(-128) = -16256;
+        // ceil(2^31 / 16256) = 132105 of them pass INT32_MIN -> 0x80000000.
+        // -----------------------------------------------
+        $display("\n=== Test 8: INT32 saturation ===");
+        rnd_a = new[131072]; rnd_b = new[131072];
+        foreach (rnd_a[i]) begin rnd_a[i] = -8'sd128; rnd_b[i] = -8'sd128; end
+        int8_mac_sequence(rnd_a, rnd_b, 131072, test_result);
+        check32("131072 x 16384 (clamp high)", test_result, 32'h7FFFFFFF);
+        rnd_a = new[132105]; rnd_b = new[132105];
+        foreach (rnd_a[i]) begin rnd_a[i] = 8'sd127; rnd_b[i] = -8'sd128; end
+        int8_mac_sequence(rnd_a, rnd_b, 132105, test_result);
+        check32("132105 x -16256 (clamp low)", test_result, 32'h80000000);
+
+        $display("\n=== All MAC unit tests complete: %0d error(s) ===", errors);
+        if (errors == 0) $display("ALL TESTS PASSED");
+        else             $display("TESTS FAILED");
         $finish;
     end
 
     initial begin
-        #10000;
-        $display("TIMEOUT");
+        #5ms;
+        $display("FAIL: TIMEOUT");
         $finish;
     end
 
@@ -792,9 +980,10 @@ endmodule : tb_mac_unit_mixed_precision
 //    cycles, which is simpler but adds latency.
 //
 // 4. SATURATION
-//    The INT32 accumulator never overflows for INT8 inputs with K <= 65536.
-//    However, when converting the INT32 output to INT8 for requantisation
-//    (done outside this module), saturation is mandatory. See the saturation
-//    logic in mac_unit_design.md Q7.
+//    The INT32 accumulator cannot overflow for INT8 inputs with K <= 131071
+//    (|product| <= 2^14, and 131071 * 2^14 < 2^31); beyond that the saturating
+//    add clamps it to the INT32 rails (Test 8). Converting the INT32 output to
+//    INT8 for requantisation (done outside this module) also needs
+//    saturation. See the saturation logic in mac_unit_design.md Q7.
 //
 // =============================================================================

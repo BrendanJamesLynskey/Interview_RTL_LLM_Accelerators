@@ -147,35 +147,38 @@ module llm_core_coverage (
 
         cp_dim_M: coverpoint cif.dim_M {
             bins dim_min        = {1};               // 1 row: edge case
-            bins dim_small[]    = {[2:63]};           // typical small batch
+            // One bin per size class (not dim_small[] / dim_non_pow2[]: an
+            // array bin makes one bin per value, 252 bins that no regression
+            // would ever fill)
+            bins dim_small      = {[2:63]};           // typical small batch
             bins dim_head       = {64, 128};          // attention head sizes
             bins dim_medium     = {[256:1023]};       // mid-range
             bins dim_large      = {[1024:4095]};      // large FFN dims
             bins dim_max        = {4095};             // maximum
             // Non-power-of-2 sizes that expose tiling remainder logic
-            bins dim_non_pow2[] = {[65:127], [129:255]}; // odd sizes
+            bins dim_non_pow2   = {[65:127], [129:255]}; // odd sizes
             illegal_bins dim_zero = {0};             // zero dimension is illegal
         }
 
         cp_dim_K: coverpoint cif.dim_K {
             bins dim_min      = {1};
-            bins dim_small[]  = {[2:63]};
+            bins dim_small    = {[2:63]};
             bins dim_head     = {64, 128};
             bins dim_medium   = {[256:1023]};
             bins dim_large    = {[1024:4095]};
             bins dim_max      = {4095};
-            bins dim_non_pow2[] = {[65:127], [129:255]};
+            bins dim_non_pow2 = {[65:127], [129:255]};
             illegal_bins dim_zero = {0};
         }
 
         cp_dim_N: coverpoint cif.dim_N {
             bins dim_min      = {1};
-            bins dim_small[]  = {[2:63]};
+            bins dim_small    = {[2:63]};
             bins dim_head     = {64, 128};
             bins dim_medium   = {[256:1023]};
             bins dim_large    = {[1024:4095]};
             bins dim_max      = {4095};
-            bins dim_non_pow2[] = {[65:127], [129:255]};
+            bins dim_non_pow2 = {[65:127], [129:255]};
             illegal_bins dim_zero = {0};
         }
 
@@ -327,7 +330,9 @@ module llm_core_coverage (
 
         // Cross A x B patterns: corner combinations are the most interesting.
         // We constrain the cross to only the practically important pairs
-        // rather than all 5x5=25 combinations.
+        // rather than all 5x5=25 combinations: the named bins below, plus an
+        // ignore_bins for every other pair (otherwise the remaining pairs
+        // become automatic cross bins and still count towards coverage).
         cx_pattern_pair: cross cp_input_a_pattern, cp_input_b_pattern {
             // Zero x anything: output must be zero
             bins a_zero_b_any   = binsof(cp_input_a_pattern.all_zeros);
@@ -344,19 +349,35 @@ module llm_core_coverage (
             // Random x random: general correctness
             bins both_random    = binsof(cp_input_a_pattern.random) &&
                                   binsof(cp_input_b_pattern.random);
+            // Everything else. "!" only applies to a binsof() term, so the
+            // complement of the bins above is written out by De Morgan.
+            ignore_bins others  = !binsof(cp_input_a_pattern.all_zeros) &&
+                                  !binsof(cp_input_b_pattern.all_zeros) &&
+                                  (!binsof(cp_input_a_pattern.all_max)  || !binsof(cp_input_b_pattern.all_max)) &&
+                                  (!binsof(cp_input_a_pattern.all_max)  || !binsof(cp_input_b_pattern.all_min)) &&
+                                  (!binsof(cp_input_a_pattern.denormal) || !binsof(cp_input_b_pattern.random)) &&
+                                  (!binsof(cp_input_a_pattern.random)   || !binsof(cp_input_b_pattern.random));
         }
 
         // Exception flags: verify they fire at least once
         cp_overflow:  coverpoint cif.overflow_flag  { bins seen = {1'b1}; }
         cp_underflow: coverpoint cif.underflow_flag { bins seen = {1'b1}; }
         cp_nan:       coverpoint cif.nan_flag {
-            bins seen = {1'b1};
-            // NaN is illegal in integer modes — flag its assertion as an error.
-            illegal_bins int_nan = {1'b1}
-                                   iff (cif.precision inside {PREC_INT8, PREC_INT4});
+            // Only a NaN in an FP mode counts. (A NaN in an integer mode is an
+            // error: that is checked by a_no_int_nan below rather than an
+            // "illegal_bins ... iff": illegal/ignore bins remove their values
+            // from the other bins whatever the iff, and some simulators --
+            // xsim 2025.2 -- ignore the iff, making every NaN illegal.)
+            bins seen = {1'b1}
+                        iff (!(cif.precision inside {PREC_INT8, PREC_INT4}));
         }
 
     endgroup : cg_data_patterns
+
+    // NaN is illegal in integer modes
+    a_no_int_nan: assert property (@(posedge cif.clk) disable iff (!cif.rst_n)
+        (cif.txn_valid && cif.nan_flag) |-> !(cif.precision inside {PREC_INT8, PREC_INT4}))
+        else $error("nan_flag asserted in an integer precision mode");
 
 
     // =======================================================================
@@ -401,9 +422,9 @@ module llm_core_coverage (
         // Classify K dimension (inner dimension drives the accumulation depth)
         cp_K_class: coverpoint cif.dim_K {
             bins k_tiny    = {[1:7]};     // less than one INT4 vector lane
-            bins k_aligned = {[8:255]};   // multiples of 8 (INT4 friendly)
+            bins k_aligned = {[8:255]} with (item % 8 == 0);   // multiples of 8 (INT4 friendly)
             bins k_large   = {[256:4095]};
-            bins k_unaligned = {[9:255]}; // odd / non-8-multiple values
+            bins k_unaligned = {[9:255]} with (item % 8 != 0); // non-8-multiple values
             illegal_bins k_zero = {0};
         }
 
@@ -600,8 +621,6 @@ endmodule : llm_core_coverage
 // =============================================================================
 module coverage_plan_tb;
 
-    import "DPI-C" function real exp_c(input real x); // placeholder
-
     logic clk;
     initial clk = 0;
     always #5 clk = ~clk;
@@ -611,6 +630,15 @@ module coverage_plan_tb;
 
     // Instantiate the coverage collector
     llm_core_coverage cov_collect (.cif(cov_if));
+
+    int cov_errors = 0;
+
+    task automatic check_cov(input string name, input real got, input real exp);
+        if (got < exp - 0.01 || got > exp + 0.01) begin
+            $display("  MISMATCH %s: %.3f%%, expected %.3f%%", name, got, exp);
+            cov_errors++;
+        end
+    endtask
 
     // -----------------------------------------------------------------------
     // Drive a variety of transactions to hit a representative sample of bins
@@ -636,7 +664,9 @@ module coverage_plan_tb;
         cov_if.underflow_flag  = 1'b0;
         cov_if.nan_flag        = 1'b0;
         cov_if.txn_valid       = 1'b1;
-        @(posedge clk);
+        // Hold for the posedge the covergroups sample on; drop at the next
+        // negedge (clearing it right after the posedge would race the sampling)
+        @(negedge clk);
         cov_if.txn_valid       = 1'b0;
     endtask
 
@@ -692,6 +722,7 @@ module coverage_plan_tb;
         send_txn(PREC_FP16, OP_GEMM, PIPE_COMPUTING, PAT_RANDOM, PAT_RANDOM, 4095,4095,4095); // max
         send_txn(PREC_INT4, OP_GEMM, PIPE_COMPUTING, PAT_RANDOM, PAT_RANDOM,   65,  65,  65); // non-pow2
         send_txn(PREC_INT8, OP_GEMM, PIPE_COMPUTING, PAT_RANDOM, PAT_RANDOM, 2048,   7,  64); // tiny K
+        send_txn(PREC_MIXED,OP_GEMM, PIPE_COMPUTING, PAT_RANDOM, PAT_RANDOM,   64, 100,  64); // K not a multiple of 8: must not count as aligned
 
         // ---- Data pattern corners ----
         $display("[TB] Sweeping data patterns...");
@@ -709,7 +740,7 @@ module coverage_plan_tb;
         cov_if.dim_N           = 12'd256;
         cov_if.overflow_flag   = 1'b1; // synthetic overflow
         cov_if.txn_valid       = 1'b1;
-        @(posedge clk);
+        @(negedge clk);
         cov_if.txn_valid     = 1'b0;
         cov_if.overflow_flag = 1'b0;
 
@@ -721,7 +752,24 @@ module coverage_plan_tb;
         // ---- Final coverage report ----
         cov_collect.report_coverage();
 
-        $display("\n=== Coverage plan TB complete ===\n");
+        // ---- Self-check ----
+        // Expected coverage for exactly this stimulus, derived independently
+        // of the simulator (a model of the sample stream -- one gated sample
+        // per transaction, two ungated samples per transaction -- and of the
+        // bins, auto cross bins and ignore bins above). A mismatch means the
+        // model is not sampling or binning what this file says it does.
+        check_cov("cg_matrix_dimensions",     cov_collect.cg_dims_inst.get_coverage(),       72.959);
+        check_cov("cg_precision_modes",       cov_collect.cg_prec_inst.get_coverage(),      100.000);
+        check_cov("cg_precision_transitions", cov_collect.cg_prec_trans_inst.get_coverage(), 90.000);
+        check_cov("cg_pipeline_states",       cov_collect.cg_pipe_inst.get_coverage(),       69.444);
+        check_cov("cg_data_patterns",         cov_collect.cg_data_inst.get_coverage(),       51.111);
+        check_cov("cg_operation_types",       cov_collect.cg_op_inst.get_coverage(),         60.000);
+        check_cov("cg_prec_x_dims",           cov_collect.cg_prec_dims_inst.get_coverage(),  85.000);
+        check_cov("cg_prec_x_data",           cov_collect.cg_prec_data_inst.get_coverage(),  84.058);
+        check_cov("cg_op_x_pipe",             cov_collect.cg_op_pipe_inst.get_coverage(),    82.222);
+
+        if (cov_errors == 0) $display("\n=== Coverage plan TB complete: all coverage as expected ===\n");
+        else                 $display("\n=== Coverage plan TB FAILED: %0d mismatch(es) ===\n", cov_errors);
         $finish;
     end
 

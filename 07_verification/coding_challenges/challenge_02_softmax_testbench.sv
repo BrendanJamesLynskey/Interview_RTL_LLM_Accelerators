@@ -12,9 +12,9 @@
 //   clk            : input  logic         — clock
 //   reset_n        : input  logic         — active-low synchronous reset
 //   input_valid    : input  logic         — one-cycle pulse: input data valid
-//   input_data     : input  logic [15:0][N_ELEMENTS-1:0]  — flat input vector
+//   input_data     : input  logic signed [15:0] input_data [N_ELEMENTS]  — unpacked array
 //   output_valid   : output logic         — one-cycle pulse: output data valid
-//   output_data    : output logic [7:0][N_ELEMENTS-1:0]   — flat output vector
+//   output_data    : output logic [7:0] output_data [N_ELEMENTS]         — unpacked array
 //
 // The DUT has a pipeline latency of PIPE_LATENCY cycles from input_valid to
 // output_valid. The DUT is ready to accept a new input every cycle (no stall).
@@ -48,6 +48,10 @@
 // simulator with covergroup support, e.g. Questa:
 //   vlog -sv -dpiheader dpi_header.h challenge_02_softmax_testbench.sv softmax_golden.c
 //   vsim -c softmax_testbench -do "run -all"
+// or the Vivado simulator (xsim, verified with 2025.2):
+//   xsc softmax_golden.c
+//   xvlog -sv challenge_02_softmax_testbench.sv
+//   xelab softmax_testbench -sv_lib dpi -s snap && xsim snap -R
 //
 // A behavioural softmax_dut stand-in is included at the end of this file so
 // the testbench elaborates and runs out of the box. Replace it with your RTL.
@@ -201,7 +205,7 @@ class SoftmaxDriver;
     byte                 dpi_output [softmax_pkg::N_ELEMENTS];
     int pattern;
 
-    $urandom(seed);  // set random seed
+    process::self().srandom(seed);  // seed this thread's RNG for reproducibility
 
     for (int t = 0; t < softmax_pkg::NUM_TESTS; t++) begin
       // Choose data pattern: cycle through 0..5 with mostly random
@@ -342,9 +346,15 @@ class SoftmaxScoreboard;
     end
   endtask
 
-  function void report();
+  // Every driven vector must produce exactly one checked output
+  function void report(int expected_txns);
+    if (total_checks != expected_txns || txn_fifo.num() != 0 || out_fifo.num() != 0) begin
+      $error("[Scoreboard] %0d transactions checked (expected %0d); %0d expected and %0d DUT outputs left unmatched",
+             total_checks, expected_txns, txn_fifo.num(), out_fifo.num());
+      total_errors++;
+    end
     $display("");
-    $display({60{"="}});
+    $display("%s", {60{"="}});
     $display("[Scoreboard] Final Report");
     $display("  Total transactions  : %0d", total_checks);
     $display("  Errors (diff > %0d) : %0d", softmax_pkg::OUTPUT_TOLERANCE, total_errors);
@@ -353,7 +363,7 @@ class SoftmaxScoreboard;
       $display("  RESULT: PASS");
     else
       $display("  RESULT: FAIL");
-    $display({60{"="}});
+    $display("%s", {60{"="}});
   endfunction
 
 endclass : SoftmaxScoreboard
@@ -462,6 +472,12 @@ class SoftmaxCoverage;
   function void report();
     $display("[Coverage] Input  covergroup: %.1f%%",
              softmax_input_cg.get_coverage());
+    $display("[Coverage]   cp_input_range %.1f%%, cp_max_value %.1f%%, cp_zero_elements %.1f%%, cp_n_elements %.1f%%, cx_extreme_singlehot %.1f%%",
+             softmax_input_cg.cp_input_range.get_coverage(),
+             softmax_input_cg.cp_max_value.get_coverage(),
+             softmax_input_cg.cp_zero_elements.get_coverage(),
+             softmax_input_cg.cp_n_elements.get_coverage(),
+             softmax_input_cg.cx_extreme_singlehot.get_coverage());
     $display("[Coverage] Output covergroup: %.1f%%",
              softmax_output_cg.get_coverage());
   endfunction
@@ -563,7 +579,7 @@ module softmax_testbench;
     repeat (PIPE_LATENCY + 10) @(posedge clk);
 
     // Final reports
-    scoreboard.report();
+    scoreboard.report(NUM_TESTS);
     cov_model.report();
 
     // Fail simulation if any errors were detected

@@ -44,7 +44,11 @@
 // ------------------
 // After start is asserted, the scheduler begins issuing (m, n, k) tuples in
 // output-stationary order. Each tuple is held until next_ready is asserted.
-// After the last tuple (M-1, N-1, K-1), done is pulsed for one cycle.
+// After the last tuple (M-1, N-1, K-1) is accepted, done is pulsed for one
+// cycle. A tuple is accepted on a clock edge where valid && next_ready; the
+// scheduler then spends one cycle (S_ADVANCE, valid low) stepping the counters,
+// so it issues at most one tuple every two cycles. start in IDLE or in the
+// done cycle (re)starts from (0,0,0).
 //
 // EXAMPLE (M=4, K=4, N=4, all tiles = 2 -> 2x2x2 = 8 tiles):
 // Issue order: (0,0,0),(0,0,1),(0,1,0),(0,1,1),(1,0,0),(1,0,1),(1,1,0),(1,1,1)
@@ -121,12 +125,18 @@ module tile_scheduler #(
         cnt_n_next = cnt_n;
         cnt_m_next = cnt_m;
 
-        if (state == S_ADVANCE) begin
+        if (start && (state == S_IDLE || state == S_DONE)) begin
+            // (Re)start from tile (0,0,0)
+            cnt_k_next = '0;
+            cnt_n_next = '0;
+            cnt_m_next = '0;
+        end else if (state == S_ADVANCE) begin
             if (k_wrap) begin
                 cnt_k_next = '0;
                 if (n_wrap) begin
                     cnt_n_next = '0;
-                    // m increments even on last tile -- will be caught by S_DONE
+                    // (never reached on the last tile: S_OUTPUT goes straight
+                    //  to S_DONE when m_wrap, so cnt_m cannot overflow)
                     cnt_m_next = cnt_m + 1'b1;
                 end else begin
                     cnt_n_next = cnt_n + 1'b1;
@@ -182,9 +192,9 @@ module tile_scheduler #(
             end
 
             S_DONE: begin
-                // Stay done until reset or new start
-                if (start)
-                    next_state = S_OUTPUT;   // Allow restart without full reset
+                // done is a one-cycle pulse; a start in this cycle restarts
+                // immediately, otherwise return to IDLE
+                next_state = start ? S_OUTPUT : S_IDLE;
             end
 
             default: next_state = S_IDLE;
@@ -200,24 +210,7 @@ module tile_scheduler #(
         n_idx  = cnt_n;
         k_idx  = cnt_k;
         last_k = k_wrap;
-        done   = (state == S_DONE) && !start;  // Pulse; cleared by new start
-    end
-
-    // -------------------------------------------------------------------------
-    // Reset counter on new start (when in S_DONE)
-    // -------------------------------------------------------------------------
-    // Note: The counter reset on restart is handled implicitly because S_ADVANCE
-    // increments from the last position. For a clean restart from (0,0,0), the
-    // counter registers are reset when we transition out of S_DONE on start.
-    // We add explicit reset logic here:
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            // already handled above
-        end else if (start && (state == S_DONE || state == S_IDLE)) begin
-            cnt_m <= '0;
-            cnt_n <= '0;
-            cnt_k <= '0;
-        end
+        done   = (state == S_DONE);            // One-cycle pulse
     end
 
     // -------------------------------------------------------------------------
@@ -257,17 +250,18 @@ endmodule
 // synthesis translate_off
 module tb_tile_scheduler;
 
-    // Use a small matrix for exhaustive checking: M=8, K=8, N=8, tiles=4
-    // -> 2 M-tiles * 2 N-tiles * 2 K-tiles = 8 total issues
+    // Non-square tile grid so any m/n/k swap in the loop order shows up:
+    // M=8, K=16, N=12, tiles=4 -> 2 M-tiles * 3 N-tiles * 4 K-tiles = 24 issues
     localparam int M      = 8;
-    localparam int K      = 8;
-    localparam int N      = 8;
+    localparam int K      = 16;
+    localparam int N      = 12;
     localparam int TILE_M = 4;
     localparam int TILE_K = 4;
     localparam int TILE_N = 4;
     localparam int NUM_M  = M / TILE_M;   // 2
-    localparam int NUM_K  = K / TILE_K;   // 2
-    localparam int NUM_N  = N / TILE_N;   // 2
+    localparam int NUM_K  = K / TILE_K;   // 4
+    localparam int NUM_N  = N / TILE_N;   // 3
+    localparam int TOTAL  = NUM_M * NUM_N * NUM_K;
 
     logic clk, rst_n, start, next_ready, valid, last_k, done;
     logic [$clog2(NUM_M)-1:0] m_idx;
@@ -284,127 +278,129 @@ module tb_tile_scheduler;
     initial clk = 0;
     always #5 clk = ~clk;
 
-    // Expected output sequence (output-stationary order)
-    // (m, n, k) with last_k flag
+    // Expected output sequence (output-stationary order), built from the
+    // loop nest in the problem statement
     typedef struct {
         int m, n, k;
         bit last;
     } tile_coord_t;
 
-    tile_coord_t expected_seq[] = '{
-        '{0,0,0,0}, '{0,0,1,1},    // Output tile (0,0), k sweeps 0->1
-        '{0,1,0,0}, '{0,1,1,1},    // Output tile (0,1), k sweeps 0->1
-        '{1,0,0,0}, '{1,0,1,1},    // Output tile (1,0), k sweeps 0->1
-        '{1,1,0,0}, '{1,1,1,1}     // Output tile (1,1), k sweeps 0->1
-    };
+    tile_coord_t expected_q[$];
+    int  issue_count;
+    int  done_count;
+    int  errors;
+    bit  random_ready;
 
-    int issue_count;
-    int errors;
+    task automatic load_expected();
+        expected_q.delete();
+        for (int m = 0; m < NUM_M; m++)
+            for (int n = 0; n < NUM_N; n++)
+                for (int k = 0; k < NUM_K; k++)
+                    expected_q.push_back('{m, n, k, k == NUM_K - 1});
+    endtask
 
-    task automatic check_tile(
-        input int exp_m, exp_n, exp_k,
-        input bit exp_last
-    );
-        if (m_idx != exp_m || n_idx != exp_n || k_idx != exp_k || last_k != exp_last) begin
-            $error("MISMATCH at issue %0d: got (%0d,%0d,%0d,last=%0b) expected (%0d,%0d,%0d,last=%0b)",
-                   issue_count, m_idx, n_idx, k_idx, last_k,
-                   exp_m, exp_n, exp_k, exp_last);
-            errors++;
-        end else begin
-            $display("  OK tile %0d: m=%0d n=%0d k=%0d last_k=%0b",
-                     issue_count, m_idx, n_idx, k_idx, last_k);
+    // Monitor: sample on every posedge (stimulus changes on negedge).
+    // A tuple is accepted when valid && next_ready; a held tuple
+    // (valid && !next_ready) must still be valid, unchanged, next cycle.
+    logic       held;
+    logic [$clog2(NUM_M)-1:0] held_m;
+    logic [$clog2(NUM_N)-1:0] held_n;
+    logic [$clog2(NUM_K)-1:0] held_k;
+    always @(posedge clk) begin
+        if (rst_n) begin
+            if (held && !(valid && m_idx == held_m && n_idx == held_n && k_idx == held_k)) begin
+                $display("  ERROR: held tuple (%0d,%0d,%0d) changed or dropped under back-pressure",
+                         held_m, held_n, held_k);
+                errors++;
+            end
+            held = valid && !next_ready;
+            held_m = m_idx; held_n = n_idx; held_k = k_idx;
+
+            if (valid && next_ready) begin
+                if (expected_q.size() == 0) begin
+                    $display("  ERROR: extra tuple (%0d,%0d,%0d) after the sequence", m_idx, n_idx, k_idx);
+                    errors++;
+                end else begin
+                    tile_coord_t e;
+                    e = expected_q.pop_front();
+                    if (m_idx != e.m || n_idx != e.n || k_idx != e.k || last_k != e.last) begin
+                        $display("  ERROR at issue %0d: got (%0d,%0d,%0d,last=%0b) expected (%0d,%0d,%0d,last=%0b)",
+                                 issue_count, m_idx, n_idx, k_idx, last_k, e.m, e.n, e.k, e.last);
+                        errors++;
+                    end
+                end
+                issue_count++;
+            end
+            if (done) begin
+                done_count++;
+                if (expected_q.size() != 0) begin
+                    $display("  ERROR: done with %0d tuples still to issue", expected_q.size());
+                    errors++;
+                end
+            end
         end
+    end
+
+    // Consumer: next_ready always high, or random (about half the cycles)
+    always @(negedge clk)
+        if (random_ready) next_ready = ($urandom_range(1) == 1);
+
+    // Run one full schedule and check count and done pulse
+    task automatic run_schedule(input string name, input bit rnd);
+        load_expected();
+        issue_count  = 0;
+        done_count   = 0;
+        random_ready = rnd;
+        if (!rnd) next_ready = 1;
+        @(negedge clk);
+        start = 1;
+        @(negedge clk);
+        start = 0;
+        fork
+            begin : wait_done
+                wait (done_count > 0);
+            end
+            begin : timeout_proc
+                repeat (1000) @(posedge clk);
+                $display("  ERROR: timeout waiting for done");
+                errors++;
+            end
+        join_any
+        disable wait_done;
+        disable timeout_proc;
+        repeat (4) @(negedge clk);        // done must not repeat
+        if (issue_count != TOTAL || done_count != 1) begin
+            $display("  ERROR %s: %0d tuples, %0d done cycles (expected %0d, 1)",
+                     name, issue_count, done_count, TOTAL);
+            errors++;
+        end else
+            $display("  %s: %0d tuples in order, done pulsed once", name, issue_count);
     endtask
 
     initial begin
         // Initialise
-        rst_n      = 0;
-        start      = 0;
-        next_ready = 0;
-        issue_count = 0;
-        errors     = 0;
+        rst_n        = 0;
+        start        = 0;
+        next_ready   = 0;
+        random_ready = 0;
+        errors       = 0;
+        held         = 0;
 
-        repeat(3) @(posedge clk);
+        repeat(3) @(negedge clk);
         rst_n = 1;
-        @(posedge clk);
+        @(negedge clk);
 
         // Test 1: Normal sequential scheduling (next_ready always high)
         $display("=== Test 1: Sequential scheduling (next_ready always high) ===");
-        next_ready = 1;
-        @(posedge clk);
-        start = 1;
-        @(posedge clk);
-        start = 0;
+        run_schedule("Test 1", 0);
 
-        // Wait for done, checking each issued tile
-        fork
-            begin : check_proc
-                forever begin
-                    @(posedge clk);
-                    if (valid) begin
-                        check_tile(
-                            expected_seq[issue_count].m,
-                            expected_seq[issue_count].n,
-                            expected_seq[issue_count].k,
-                            expected_seq[issue_count].last
-                        );
-                        issue_count++;
-                    end
-                end
-            end
-            begin : timeout_proc
-                repeat(200) @(posedge clk);
-                $fatal(1, "Timeout waiting for tiles");
-            end
-            begin : done_proc
-                @(posedge done);
-            end
-        join_any
-        disable check_proc;
-        disable timeout_proc;
+        // Test 2: Back-pressure - random next_ready
+        $display("=== Test 2: Random back-pressure ===");
+        run_schedule("Test 2", 1);
 
-        assert (issue_count == NUM_M * NUM_N * NUM_K)
-            else $error("Expected %0d tiles, got %0d", NUM_M*NUM_N*NUM_K, issue_count);
-
-        @(posedge clk);
-        assert (!done) else $error("Done should be deasserted after one cycle");
-
-        // Test 2: Back-pressure - next_ready deasserted for several cycles
-        $display("=== Test 2: Back-pressure test ===");
-        issue_count = 0;
-        next_ready  = 0;
-        @(posedge clk);
-        start = 1;
-        @(posedge clk);
-        start = 0;
-
-        repeat(NUM_M * NUM_N * NUM_K) begin
-            // Wait 3 cycles before accepting each tile
-            @(posedge clk);
-            assert (valid) else $error("Scheduler should hold valid during back-pressure");
-            @(posedge clk);
-            assert (valid) else $error("valid dropped during back-pressure");
-            @(posedge clk);
-            next_ready = 1;
-            @(posedge clk);
-            next_ready = 0;
-            issue_count++;
-        end
-
-        @(posedge done);
-        $display("  Back-pressure test passed, %0d tiles issued", issue_count);
-
-        // Test 3: Restart capability
-        $display("=== Test 3: Restart from DONE state ===");
-        issue_count = 0;
-        next_ready  = 1;
-        @(posedge clk);
-        start = 1;
-        @(posedge clk);
-        start = 0;
-        @(posedge done);
-        // Should have seen 8 tiles again
-        @(posedge clk);
+        // Test 3: Restart after done (counters must restart at (0,0,0))
+        $display("=== Test 3: Restart after done ===");
+        run_schedule("Test 3", 0);
 
         // Final report
         if (errors == 0)

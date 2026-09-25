@@ -83,7 +83,7 @@ module exp_lut (
             // We approximate with the formula: val = 32767 * exp(-8 + k*8/255)
             // Actual values computed offline and loaded; this init is illustrative.
             // For simulation purposes we use $exp (non-synthesisable).
-            lut_mem[k] = $rtoi(32767.0 * $exp(-8.0 + (k * 8.0) / 255.0));
+            lut_mem[k] = $rtoi(32767.0 * $exp(-8.0 + (k * 8.0) / 255.0) + 0.5);
         end
     end
 
@@ -120,11 +120,14 @@ module exp_fixed (
     wire [15:0] x_shifted;
     assign x_shifted = x_clamped + 16'sd16384; // Now in [0, 16384] representing [0, 8]
 
-    // Scale to [0, 255]: index = x_shifted * 255 / 16384 = x_shifted >> 6 (approx)
-    // More precisely: x_shifted * 255 / 16384 = (x_shifted * 255) >> 14
-    // Use truncation (floor) - adequate for LUT indexing
-    wire [7:0] lut_index;
-    assign lut_index = x_shifted[14:7]; // Top 8 bits of 15-bit range [0, 16384]
+    // Scale to [0, 255]: index = round(x_shifted * 255 / 16384)
+    //                          = (x_shifted * 255 + 8192) >> 14
+    // (x_shifted <= 16384, so the product fits in 23 bits.) Rounding keeps the
+    // x error within half a LUT step, 4/255 = 0.0157, i.e. <= 1.6% in exp(x).
+    wire [22:0] x_scaled;
+    wire [7:0]  lut_index;
+    assign x_scaled  = x_shifted * 23'd255 + 23'd8192;
+    assign lut_index = x_scaled[21:14];
 
     exp_lut u_lut (
         .clk     (clk),
@@ -135,14 +138,19 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// Reciprocal unit: computes R ≈ 1/D using one Newton-Raphson iteration.
-// Input  : 32-bit unsigned Q16.16 fixed-point (sum of exp values)
-// Output : 32-bit unsigned Q0.32 fixed-point (reciprocal, in [0, 1] after scaling)
+// Reciprocal unit: computes R ≈ 1/D using two Newton-Raphson iterations.
+// Input  : 32-bit unsigned Q16.16 fixed-point (sum of exp values, D >= 1.0 --
+//          the maximum score always contributes exp(0) = 1)
+// Output : 32-bit unsigned Q0.32 fixed-point: R = min(2^32 - 1, 2^32 / D)
 // Latency: 4 cycles
 //
 // Algorithm:
-//   1. Initial estimate R0 from 8-bit LUT indexed by top 8 bits of D.
-//   2. R1 = R0 * (2 - D * R0)  [one Newton iteration, doubles bits of accuracy]
+//   1. Normalise: find the leading one p of D and shift so Dn = D * 2^(31-p)
+//      is Q1.31 in [1, 2). Initial estimate r0 ≈ 1/Dn (Q1.31) from a 256-entry
+//      LUT indexed by the 8 bits below the leading one (~8 good bits).
+//   2. r1 = r0 * (2 - Dn * r0)  [Newton iteration, doubles the good bits: ~16]
+//   3. r2 = r1 * (2 - Dn * r1)  [~30 bits, limited by the 31-bit fraction]
+//   4. Denormalise: 1/D = (1/Dn) * 2^-(p-16), so R (Q0.32) = r2 * 2 >> (p-16)
 // -----------------------------------------------------------------------------
 module reciprocal_unit (
     input  wire        clk,
@@ -151,56 +159,71 @@ module reciprocal_unit (
     output reg         valid_out,
     output reg  [31:0] R          // Q0.32 reciprocal approximation
 );
-    // Initial estimate LUT: maps top 8 bits of D to 8-bit approximation of 1/D
-    // scaled to Q0.8. In hardware this is an 8-bit addressed, 8-bit data ROM.
-    reg [7:0] recip_lut [0:255];
+    // Initial estimate LUT: entry i ≈ 1 / (1 + (i + 0.5)/256), Q1.31
+    // (midpoint of the Dn interval the index covers). In hardware this is an
+    // 8-bit addressed ROM; only the top ~9 bits of each entry matter.
+    reg [31:0] recip_lut [0:255];
     integer m;
     initial begin
-        recip_lut[0] = 8'hFF; // guard: D≈0 -> maximum reciprocal
-        for (m = 1; m < 256; m = m + 1) begin
-            // top 8 bits of Q16.16 -> D in [1, 256] in integer units
-            // 1/D scaled to Q0.8: round(256 / m)
-            recip_lut[m] = $rtoi(256.0 / m) > 255 ? 8'hFF : $rtoi(256.0 / m);
-        end
+        for (m = 0; m < 256; m = m + 1)
+            recip_lut[m] = $rtoi(2147483648.0 / (1.0 + (m + 0.5) / 256.0));
     end
+
+    // Leading-one position (0..31) of a non-zero word
+    function automatic [4:0] lead_one(input [31:0] x);
+        lead_one = 5'd0;
+        for (int i = 0; i < 32; i++)
+            if (x[i]) lead_one = i[4:0];
+    endfunction
+
+    // One Newton-Raphson step on Q1.31 operands: r * (2 - dn*r)
+    function automatic [31:0] nr_step(input [31:0] dn, input [31:0] r);
+        logic [63:0] e;     // dn*r, Q2.62
+        logic [32:0] t;     // 2 - dn*r, Q2.31 (2.0 = 2^32)
+        logic [63:0] rt;    // r*t, Q3.62
+        e  = dn * r;
+        t  = 33'h1_0000_0000 - e[63:31];
+        rt = r * t;
+        nr_step = rt[62:31];
+    endfunction
 
     // Pipeline registers
     reg        valid_s1, valid_s2, valid_s3;
-    reg [31:0] D_s1, D_s2, D_s3;
-    reg [15:0] R0_s1, R0_s2;
-    reg [31:0] D_times_R0;
+    reg [4:0]  p_s1, p_s2, p_s3;
+    reg [31:0] dn_s1, dn_s2;
+    reg [31:0] r_s1, r_s2, r_s3;
 
-    // Stage 1: LUT lookup for initial estimate
-    wire [7:0] D_top8 = D[31:24];
+    // Stage 1: normalise + LUT lookup for initial estimate
+    wire [4:0]  p_in  = lead_one(D);
+    wire [31:0] dn_in = D << (5'd31 - p_in);
 
     always_ff @(posedge clk) begin
         valid_s1 <= valid_in;
-        D_s1     <= D;
-        R0_s1    <= {recip_lut[D_top8], 8'b0}; // extend to Q0.16
+        p_s1     <= p_in;
+        dn_s1    <= dn_in;
+        r_s1     <= recip_lut[dn_in[30:23]];
     end
 
-    // Stage 2: Compute D * R0 (32-bit * 16-bit multiply, take upper bits)
+    // Stage 2: first Newton iteration
     always_ff @(posedge clk) begin
-        valid_s2    <= valid_s1;
-        D_s2        <= D_s1;
-        R0_s2       <= R0_s1;
-        // D is Q16.16, R0 is Q0.16: product is Q16.32, we want Q16.16
-        D_times_R0  <= (D_s1 * {16'b0, R0_s1}) >> 16;
+        valid_s2 <= valid_s1;
+        p_s2     <= p_s1;
+        dn_s2    <= dn_s1;
+        r_s2     <= nr_step(dn_s1, r_s1);
     end
 
-    // Stage 3: Compute 2 - D*R0 (in Q16.16: 2.0 = 32'h00020000)
-    reg [31:0] two_minus_DR0;
+    // Stage 3: second Newton iteration
     always_ff @(posedge clk) begin
-        valid_s3    <= valid_s2;
-        D_s3        <= D_s2;
-        two_minus_DR0 <= 32'h0002_0000 - D_times_R0;
+        valid_s3 <= valid_s2;
+        p_s3     <= p_s2;
+        r_s3     <= nr_step(dn_s2, r_s2);
     end
 
-    // Stage 4: R1 = R0 * (2 - D*R0)
+    // Stage 4: denormalise to Q0.32, saturating (D = 1.0 gives 2^32)
+    wire [63:0] r_q0_32 = ({32'b0, r_s3} << 1) >> (p_s3 - 5'd16);
     always_ff @(posedge clk) begin
         valid_out <= valid_s3;
-        // R0_s2 is Q0.16, two_minus_DR0 is Q16.16; product is Q16.32 -> take [47:16]
-        R <= ({16'b0, R0_s2} * two_minus_DR0) >> 16;
+        R <= (p_s3 < 5'd16 || r_q0_32 > 64'hFFFF_FFFF) ? 32'hFFFF_FFFF : r_q0_32[31:0];
     end
 endmodule
 
@@ -300,12 +323,13 @@ module softmax_pipeline #(
     endfunction
 
     // -------------------------------------------------------------------------
-    // Q4.11 to BF16 conversion (simplified)
+    // Q0.15 to BF16 conversion (simplified, simulation-only real arithmetic)
     // -------------------------------------------------------------------------
     function automatic [15:0] q0_15_to_bf16;
         input [15:0] q0_15;  // Unsigned Q0.15 in [0, 1)
         real         val;
         integer      exp_val;
+        integer      frac_int;
         logic [7:0]  exp_field;
         logic [6:0]  frac_field;
         begin
@@ -313,14 +337,20 @@ module softmax_pipeline #(
             if (val == 0.0) begin
                 q0_15_to_bf16 = 16'h0000;
             end else begin
-                // Normalise: find leading 1
-                exp_val   = -1;
+                // Normalise to [1, 2): val * 2^-exp_val is the input value
+                exp_val   = 0;
                 while (val < 1.0 && exp_val > -127) begin
                     val     = val * 2.0;
                     exp_val = exp_val - 1;
                 end
+                // Round the 7-bit fraction to nearest; carry into the exponent
+                frac_int = $rtoi((val - 1.0) * 128.0 + 0.5);
+                if (frac_int == 128) begin
+                    frac_int = 0;
+                    exp_val  = exp_val + 1;
+                end
                 exp_field  = exp_val + 127;
-                frac_field = $rtoi((val - 1.0) * 128.0);
+                frac_field = frac_int[6:0];
                 q0_15_to_bf16 = {1'b0, exp_field, frac_field};
             end
         end
@@ -356,7 +386,8 @@ module softmax_pipeline #(
     wire        recip_valid_out;
     wire [31:0] recip_R;
 
-    assign recip_valid_in = (state == S_PASS1) && in_valid && in_last;
+    reg recip_go;  // pulses the cycle after the last score, when d_final is complete
+    assign recip_valid_in = recip_go;
 
     reciprocal_unit u_recip (
         .clk       (clk),
@@ -380,7 +411,7 @@ module softmax_pipeline #(
     assign rd_score = score_buf[rd_ptr];
 
     // Compute exp(score - m_final) for pass 2 output
-    reg signed [SCORE_BITS-1:0] p2_exp_arg;
+    wire signed [SCORE_BITS:0] p2_diff = rd_score - m_final;
 
     // -------------------------------------------------------------------------
     // FSM: sequential state register
@@ -398,7 +429,7 @@ module softmax_pipeline #(
     always_comb begin
         state_next = state;
         case (state)
-            S_IDLE  : if (in_valid)                         state_next = S_PASS1;
+            S_IDLE  : if (in_valid)                         state_next = in_last ? S_RECIP : S_PASS1;
             S_PASS1 : if (in_valid && in_last)              state_next = S_RECIP;
             S_RECIP : if (recip_valid_out)                  state_next = S_PASS2;
             S_PASS2 : if (rd_ptr == seq_len - 1'b1)        state_next = S_IDLE;
@@ -412,69 +443,67 @@ module softmax_pipeline #(
     wire signed [SCORE_BITS-1:0] score_q4_11;
     assign score_q4_11 = bf16_to_q4_11(in_score);
 
+    // A score is accepted in IDLE (first score of a sequence) or PASS1.
+    // The first score starts from empty state (no max yet, sum 0, write
+    // address 0) rather than whatever the previous sequence left behind.
+    wire accept      = (state == S_PASS1 || state == S_IDLE) && in_valid;
+    wire first_score = (state == S_IDLE);
+    wire [PTR_BITS-1:0] wr_addr = first_score ? '0 : wr_ptr;
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wr_ptr    <= '0;
-            m_running <= -16'sd16384; // -8.0 in Q4.11 (minimum representable useful value)
+            m_running <= -16'sd32768; // -16.0 in Q4.11 (most negative value)
             d_running <= '0;
             seq_len   <= '0;
             m_final   <= '0;
             d_final   <= '0;
+            recip_go  <= 1'b0;
         end else begin
-            // Reset accumulators when a new sequence starts
-            if (state == S_IDLE && in_valid) begin
-                m_running <= -16'sd16384;
-                d_running <= 32'h0000_0000;
-                wr_ptr    <= '0;
-            end
+            // Start the reciprocal one cycle after the last score, once
+            // d_final holds the complete sum
+            recip_go <= accept && in_last;
 
-            if ((state == S_PASS1 || state == S_IDLE) && in_valid) begin
+            if (accept) begin
                 // Buffer the incoming score
-                score_buf[wr_ptr] <= score_q4_11;
-                wr_ptr            <= wr_ptr + 1'b1;
+                score_buf[wr_addr] <= score_q4_11;
+                wr_ptr             <= wr_addr + 1'b1;
 
-                // Update running max
-                if (score_q4_11 > m_running)
-                    m_running <= score_q4_11;
-
-                // Update running sum (simplified: one-cycle online update).
-                // Full implementation would pipeline the exp computation and stall
-                // here; for correctness in simulation we compute combinatorially.
-                // delta = m_running - max(m_running, score_q4_11)
-                // exp_delta * d_running + exp(score - new_max)
-                // Note: this combinatorial block is non-synthesisable as written;
-                // a pipelined version would register the exp output from u_exp.
+                // Online update of running max and sum (one score per cycle).
+                // The exp terms use real arithmetic: simulation-only, like
+                // the BF16 conversion above. A synthesisable version would
+                // pipeline two exp_fixed units here (and stall in_ready).
+                // new_max   = max(m_running, score)
+                // d_running = exp(m_running - new_max) * d_running + exp(score - new_max)
                 begin
                     automatic logic signed [SCORE_BITS-1:0] new_max;
-                    automatic logic signed [SCORE_BITS-1:0] delta_arg;
-                    automatic logic signed [SCORE_BITS-1:0] score_arg;
+                    automatic logic signed [SCORE_BITS:0]   delta_arg;  // 17 bits: no wrap
+                    automatic logic signed [SCORE_BITS:0]   score_arg;
                     automatic real  exp_delta_real, exp_score_real;
-                    automatic real  d_new_real;
+                    automatic real  d_prev_real, d_new_real;
+                    automatic logic [ACC_BITS-1:0] d_new;
 
-                    new_max = (score_q4_11 > m_running) ? score_q4_11 : m_running;
-                    delta_arg = m_running - new_max; // <= 0
+                    new_max = (first_score || score_q4_11 > m_running) ? score_q4_11 : m_running;
+                    delta_arg = m_running - new_max; // <= 0 (unused for the first score)
                     score_arg = score_q4_11 - new_max; // <= 0
 
-                    // Use real arithmetic for simulation; hardware would use exp_fixed units
                     exp_delta_real = $exp($itor(delta_arg) / 2048.0);
                     exp_score_real = $exp($itor(score_arg) / 2048.0);
+                    d_prev_real    = first_score ? 0.0 : $itor(d_running) / 65536.0;
 
-                    d_new_real = (exp_delta_real * $itor(d_running) / 65536.0)
-                                 + exp_score_real;
-                    d_running <= $rtoi(d_new_real * 65536.0); // Back to Q16.16
+                    d_new_real = exp_delta_real * d_prev_real + exp_score_real;
+                    d_new      = $rtoi(d_new_real * 65536.0); // Back to Q16.16
+
+                    m_running <= new_max;
+                    d_running <= d_new;
+
+                    // Capture final state on last score (including its own term)
+                    if (in_last) begin
+                        seq_len <= wr_addr + 1'b1;
+                        m_final <= new_max;
+                        d_final <= d_new;
+                    end
                 end
-
-                // Capture final state on last score
-                if (in_last) begin
-                    seq_len <= wr_ptr + 1'b1;
-                    m_final <= (score_q4_11 > m_running) ? score_q4_11 : m_running;
-                    // d_final updated one cycle later; use a flag
-                end
-            end
-
-            // Latch d_final one cycle after last score processed
-            if (state == S_PASS1 && in_valid && in_last) begin
-                d_final <= d_running; // Captured in next cycle when state->S_RECIP
             end
         end
     end
@@ -490,14 +519,20 @@ module softmax_pipeline #(
     // -------------------------------------------------------------------------
     // Pass 2 datapath: read buffered scores, compute final weights
     // -------------------------------------------------------------------------
-    // Pipeline: rd_ptr -> exp_fixed (1 cycle) -> multiply by R_stored (1 cycle) -> output
+    // Pipeline: rd_ptr -> exp_arg_reg (1 cycle) -> exp LUT registered output
+    // (1 cycle) -> multiply by R_stored + BF16 convert into out_weight (1 cycle)
 
     reg [PTR_BITS-1:0] rd_ptr_d1;       // Delayed read pointer for output alignment
-    reg                rd_valid_d1, rd_last_d1;
+    reg                rd_valid_d1, rd_last_d1;   // exp_arg_reg holds this entry
+    reg                rd_valid_d2, rd_last_d2;   // exp_result_wire holds this entry
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rd_ptr    <= '0;
+            rd_valid_d1 <= 1'b0;
+            rd_last_d1  <= 1'b0;
+            rd_valid_d2 <= 1'b0;
+            rd_last_d2  <= 1'b0;
             out_valid <= 1'b0;
             out_weight<= 16'h0;
             out_last  <= 1'b0;
@@ -505,7 +540,9 @@ module softmax_pipeline #(
             // Advance read pointer in pass 2
             if (state == S_PASS2) begin
                 // Drive exp_arg for the exp unit (registered, 1-cycle latency)
-                exp_arg_reg <= rd_score - m_final; // Q4.11 subtraction
+                // Q4.11 subtraction in 17 bits (a spread > 16 would wrap in
+                // 16), saturated to -8.0, below which exp_fixed clamps anyway
+                exp_arg_reg <= (p2_diff < -17'sd16384) ? -16'sd16384 : p2_diff[SCORE_BITS-1:0];
                 rd_ptr      <= rd_ptr + 1'b1;
                 rd_ptr_d1   <= rd_ptr;
                 rd_valid_d1 <= 1'b1;
@@ -515,16 +552,17 @@ module softmax_pipeline #(
                 rd_valid_d1 <= 1'b0;
                 rd_last_d1  <= 1'b0;
             end
+            rd_valid_d2 <= rd_valid_d1;
+            rd_last_d2  <= rd_last_d1;
 
             // One cycle after exp_arg is registered, exp_result_wire is valid.
-            // Multiply exp result (Q1.15) by reciprocal R_stored (Q0.32):
-            // product is Q1.47; we take bits [46:31] for Q1.15 result (softmax weight in [0,1]).
-            if (rd_valid_d1) begin
+            // Multiply exp result (Q1.15, <= 32767) by reciprocal R_stored
+            // (Q0.32): the product is Q1.47 (< 2^47); >> 32 gives the Q0.15
+            // softmax weight in [0, 1).
+            if (rd_valid_d2) begin
                 out_valid  <= 1'b1;
-                out_weight <= q0_15_to_bf16(
-                    ({17'b0, exp_result_wire} * R_stored) >> 31
-                );
-                out_last   <= rd_last_d1;
+                out_weight <= q0_15_to_bf16(16'((48'(exp_result_wire) * 48'(R_stored)) >> 32));
+                out_last   <= rd_last_d2;
             end else begin
                 out_valid  <= 1'b0;
                 out_last   <= 1'b0;
@@ -538,17 +576,33 @@ endmodule
 // =============================================================================
 // TESTBENCH
 // =============================================================================
-// Drives a sequence of 4 attention scores through the softmax pipeline and
-// checks that the output weights sum to approximately 1.0.
+// Drives several sequences of BF16 attention scores through the softmax
+// pipeline and checks every output weight against a real-arithmetic softmax
+// of the same (BF16-decoded) scores, plus out_last / output count.
 //
-// Test vector:
+// Test vector 1:
 //   Scores (BF16 approximation): [-2.0, 0.0, 1.0, -1.0]
 //   Expected softmax (reference):
 //     x_shift = [-3.0, -1.0, 0.0, -2.0]  (subtract max=1.0)
 //     exp     = [0.0498, 0.3679, 1.0, 0.1353]
 //     sum     = 1.5530
 //     weights = [0.0321, 0.2369, 0.6439, 0.0871]
-//     sum of weights ≈ 1.0 (check)
+// Test 2: a second 8-score sequence straight after (catches state left over
+//         from the previous sequence).
+// Test 3: a single score (weight must be ~1.0).
+// Test 4: MAX_SEQ_LEN random scores in [-12, 8) (spread > 16, so some
+//         exp arguments fall below the -8 clamp).
+// Test 5: 30 random sequences of random length.
+// After every sequence the reciprocal R = 2^32/D is also checked directly.
+//
+// Tolerance per weight (DUT vs exact softmax), derived from the datapath:
+//   exp LUT index rounding: |dx| <= 4/255      -> relative <= 1.59%
+//   BF16 output rounding (7-bit fraction)      -> relative <= 2^-8 = 0.39%
+//   LUT scale 32767 vs 32768, Q16.16 sum, 1/D  -> relative < 0.01%
+//   => relative (1.0159 * 1.0039 * 1.0001) - 1 < 2.0%
+//   exp LUT entry rounding: 0.5/32767 = 1.5e-5 absolute (weight, since d >= 1)
+//   clamp at x = -8: exp(-8) = 3.35e-4 absolute (weight, since d >= 1)
+//   => |w_dut - w_ref| <= 0.02 * w_ref + 4e-4
 // =============================================================================
 `ifdef SIMULATION
 module tb_softmax_pipeline;
@@ -583,7 +637,7 @@ module tb_softmax_pipeline;
     initial clk = 1'b0;
     always #(CLK_PERIOD/2) clk = ~clk;
 
-    // Helper function: pack a real value as approximate BF16
+    // Helper function: pack a real value as approximate BF16 (truncated)
     // (for test stimulus only)
     function automatic [15:0] real_to_bf16;
         input real val;
@@ -623,102 +677,151 @@ module tb_softmax_pipeline;
         end
     endfunction
 
-    // Test sequence: BF16 encoding of [-2.0, 0.0, 1.0, -1.0]
-    localparam int NUM_SCORES = 4;
-    logic [15:0] test_scores [0:NUM_SCORES-1];
+    // Collected output weights (filled by the output monitor)
+    real collected_weights [$];
+    bit  collected_last    [$];
+    int  errors = 0;
+    real max_r_err = 0.0;   // largest reciprocal error seen (LSB)
 
-    initial begin
-        test_scores[0] = real_to_bf16(-2.0);
-        test_scores[1] = real_to_bf16( 0.0);
-        test_scores[2] = real_to_bf16( 1.0);
-        test_scores[3] = real_to_bf16(-1.0);
+    // Output collection
+    always @(posedge clk) begin
+        if (out_valid === 1'b1) begin
+            collected_weights.push_back(bf16_to_real(out_weight));
+            collected_last.push_back(out_last);
+        end
     end
 
-    // Collected output weights
-    real collected_weights [0:NUM_SCORES-1];
-    int  out_count;
-    real weight_sum;
+    // Send one sequence, wait for its outputs, check each weight
+    task automatic run_seq(input string name, input real vals[], input bit verbose = 1);
+        logic [15:0] bf[];
+        real         x[], ref_w[];
+        real         m, d, weight_sum, tol, r_exact, r_err;
+        int          n;
+        n  = vals.size();
+        bf = new[n]; x = new[n]; ref_w = new[n];
+        foreach (vals[i]) begin
+            bf[i] = real_to_bf16(vals[i]);
+            x[i]  = bf16_to_real(bf[i]);     // exactly what the DUT sees
+        end
+        // Reference softmax in double precision
+        m = x[0];
+        foreach (x[i]) if (x[i] > m) m = x[i];
+        d = 0.0;
+        foreach (x[i]) d += $exp(x[i] - m);
+        foreach (x[i]) ref_w[i] = $exp(x[i] - m) / d;
 
-    // Test stimulus
-    initial begin
-        $display("=== Softmax Pipeline Testbench ===");
-        $display("Input scores: -2.0, 0.0, 1.0, -1.0");
-        $display("Expected weights (approx): 0.0321, 0.2369, 0.6439, 0.0871");
-        $display("");
-
-        // Reset
-        rst_n    = 1'b0;
-        in_valid = 1'b0;
-        in_last  = 1'b0;
-        in_score = 16'h0;
-        out_count = 0;
-        @(posedge clk);
-        @(posedge clk);
-        rst_n = 1'b1;
-        @(posedge clk);
-
-        // Send scores
-        $display("[TB] Starting Pass 1: sending %0d scores", NUM_SCORES);
-        for (int i = 0; i < NUM_SCORES; i++) begin
+        if (verbose) $display("\n[TB] %s: sending %0d scores", name, n);
+        collected_weights.delete();
+        collected_last.delete();
+        for (int i = 0; i < n; i++) begin
             @(negedge clk); // drive before rising edge
+            while (in_ready !== 1'b1) @(negedge clk);
             in_valid = 1'b1;
-            in_score = test_scores[i];
-            in_last  = (i == NUM_SCORES - 1);
-            $display("[TB] Sending score[%0d] = BF16 0x%04h (approx %.4f)",
-                     i, test_scores[i], bf16_to_real(test_scores[i]));
-            @(posedge clk);
+            in_score = bf[i];
+            in_last  = (i == n - 1);
         end
         @(negedge clk);
         in_valid = 1'b0;
         in_last  = 1'b0;
 
         // Wait for outputs
-        $display("[TB] Waiting for Pass 2 outputs...");
         fork
             begin : timeout_block
                 repeat (1000) @(posedge clk);
-                $display("[TB] TIMEOUT waiting for outputs");
+                $display("[TB] FAIL: TIMEOUT waiting for outputs");
+                errors++;
                 disable wait_block;
             end
             begin : wait_block
-                wait (out_count == NUM_SCORES);
+                wait (collected_weights.size() == n);
                 disable timeout_block;
             end
         join
+        repeat (5) @(posedge clk);   // any extra (spurious) outputs would show up
+        if (collected_weights.size() != n) begin
+            $display("[TB] FAIL: %0d outputs, expected %0d", collected_weights.size(), n);
+            errors++;
+        end
 
-        // Verify results
-        $display("");
-        $display("[TB] Collected softmax weights:");
         weight_sum = 0.0;
-        for (int i = 0; i < NUM_SCORES; i++) begin
-            $display("  weight[%0d] = %.6f", i, collected_weights[i]);
+        for (int i = 0; i < n && i < collected_weights.size(); i++) begin
+            tol = 0.02 * ref_w[i] + 4.0e-4;
             weight_sum += collected_weights[i];
+            if ((collected_weights[i] - ref_w[i] > tol) || (ref_w[i] - collected_weights[i] > tol)) begin
+                $display("  FAIL weight[%0d] score %8.4f: DUT %.6f  ref %.6f", i, x[i], collected_weights[i], ref_w[i]);
+                errors++;
+            end else if (verbose && n <= 8)
+                $display("  ok   weight[%0d] score %8.4f: DUT %.6f  ref %.6f", i, x[i], collected_weights[i], ref_w[i]);
+            if (collected_last[i] !== (i == n - 1)) begin
+                $display("  FAIL out_last = %0b on output %0d", collected_last[i], i);
+                errors++;
+            end
         end
-        $display("  Sum of weights = %.6f (expected ≈ 1.0)", weight_sum);
+        if (verbose) $display("  Sum of weights = %.6f", weight_sum);
 
-        if (weight_sum > 0.95 && weight_sum < 1.05)
-            $display("[TB] PASS: weights sum to approximately 1.0");
-        else
-            $display("[TB] FAIL: weight sum out of tolerance");
+        // Reciprocal precision (not visible at BF16 output precision, so
+        // checked directly): R = 2^32 / D with D = d_final / 2^16, saturated.
+        // Two Newton steps from an ~9-bit estimate leave ~2^-36 relative
+        // error; the three truncating Q1.31 steps add < 2^-29 and the final
+        // shift < 1 LSB, so allow R_exact * 2^-28 + 2 LSB.
+        r_exact = (2.0 ** 48) / $itor(dut.d_final);
+        if (r_exact > 4294967295.0) r_exact = 4294967295.0;
+        r_err = $itor(dut.R_stored) - r_exact;
+        if (r_err < 0.0) r_err = -r_err;
+        if (r_err > r_exact / (2.0 ** 28) + 2.0) begin
+            $display("  FAIL reciprocal: D = 0x%08h, R = 0x%08h, exact %.1f", dut.d_final, dut.R_stored, r_exact);
+            errors++;
+        end
+        if (r_err > max_r_err) max_r_err = r_err;
+    endtask
+
+    real seq1[] = '{-2.0, 0.0, 1.0, -1.0};
+    real seq2[] = '{3.5, -0.75, 2.25, 0.0, -4.0, 5.0, 1.5, -2.5};
+    real seq3[] = '{0.625};
+    real seq4[];
+
+    // Test stimulus
+    initial begin
+        $display("=== Softmax Pipeline Testbench ===");
+
+        // Reset
+        rst_n    = 1'b0;
+        in_valid = 1'b0;
+        in_last  = 1'b0;
+        in_score = 16'h0;
+        @(posedge clk);
+        @(posedge clk);
+        rst_n = 1'b1;
+        @(posedge clk);
+
+        run_seq("Test 1 (-2, 0, 1, -1)", seq1);
+        run_seq("Test 2 (second sequence)", seq2);
+        run_seq("Test 3 (single score)", seq3);
+        seq4 = new[MAX_SEQ_LEN];
+        foreach (seq4[i]) seq4[i] = -12.0 + 20.0 * $urandom_range(9999) / 10000.0;
+        seq4[3] = -12.0;   // make sure the spread exceeds 16
+        seq4[9] = 7.5;
+        run_seq("Test 4 (full length, spread > 16)", seq4);
+
+        // Test 5: 30 random sequences of random length 1..MAX_SEQ_LEN
+        $display("\n[TB] Test 5: 30 random sequences");
+        for (int t = 0; t < 30; t++) begin
+            seq4 = new[$urandom_range(MAX_SEQ_LEN, 1)];
+            foreach (seq4[i]) seq4[i] = -12.0 + 20.0 * $urandom_range(9999) / 10000.0;
+            run_seq("random", seq4, 0);
+        end
+        $display("  errors so far: %0d; max reciprocal error %.2f LSB", errors, max_r_err);
 
         $display("");
+        if (errors == 0) $display("[TB] PASS: all softmax weights within tolerance");
+        else             $display("[TB] FAIL: %0d error(s)", errors);
         $finish;
-    end
-
-    // Output collection
-    always_ff @(posedge clk) begin
-        if (out_valid) begin
-            collected_weights[out_count] = bf16_to_real(out_weight);
-            out_count++;
-            $display("[TB] Output weight[%0d] = BF16 0x%04h (%.6f)",
-                     out_count-1, out_weight, collected_weights[out_count-1]);
-        end
     end
 
     // Simulation timeout guard
     initial begin
         #100000;
-        $display("[TB] Global timeout");
+        $display("[TB] FAIL: Global timeout");
         $finish;
     end
 
